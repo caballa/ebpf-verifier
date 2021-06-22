@@ -1,14 +1,14 @@
 // Copyright (c) Prevail Verifier contributors.
 // SPDX-License-Identifier: MIT
 #pragma once
-
+#include <cassert>
 #include <bitset>
 
-#include "gpl/spec_type_descriptors.hpp" // for STACK_SIZE
+#include "spec_type_descriptors.hpp" // for EBPF_STACK_SIZE
 
 class bitset_domain_t final {
   private:
-    using bits_t = std::bitset<STACK_SIZE>;
+    using bits_t = std::bitset<EBPF_STACK_SIZE>;
     bits_t non_numerical_bytes;
 
   public:
@@ -52,7 +52,7 @@ class bitset_domain_t final {
         return non_numerical_bytes & other.non_numerical_bytes;
     }
 
-    std::pair<bool, bool> uniformity(int lb, int width) {
+    std::pair<bool, bool> uniformity(size_t lb, int width) {
         bool only_num = true;
         bool only_non_num = true;
         for (int j = 0; j < width; j++) {
@@ -63,17 +63,29 @@ class bitset_domain_t final {
         return std::make_pair(only_num, only_non_num);
     }
 
-    void reset(int lb, int n) {
+    void reset(size_t lb, int n) {
         for (int i = 0; i < n; i++) {
             non_numerical_bytes.reset(lb + i);
         }
     }
 
-    void havoc(int lb, int width) {
+    void havoc(size_t lb, int width) {
         for (int i = 0; i < width; i++) {
             non_numerical_bytes.set(lb + i);
         }
     }
 
     friend std::ostream& operator<<(std::ostream& o, const bitset_domain_t& array);
+
+    // Test whether all values in the range [lb,ub) are numerical.
+    bool all_num(int lb, int ub) {
+        assert(lb < ub);
+        if (lb < 0 || ub > (int)non_numerical_bytes.size())
+            return false;
+
+        for (int i = lb; i < ub; i++)
+            if (non_numerical_bytes[i])
+                return false;
+        return true;
+    }
 };

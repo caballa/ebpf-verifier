@@ -4,32 +4,16 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 
 #include "asm_files.hpp"
-#include "gpl/spec_type_descriptors.hpp"
+#include "platform.hpp"
 
 #include "elfio/elfio.hpp"
 
 using std::cout;
 using std::string;
 using std::vector;
-
-struct bpf_load_map_def {
-    unsigned int type;
-    unsigned int key_size;
-    unsigned int value_size;
-    unsigned int max_entries;
-    unsigned int map_flags;
-    unsigned int inner_map_idx;
-    unsigned int numa_node;
-};
-
-struct bpf_map_data {
-    int map_fd;
-    char* name;
-    size_t elf_offset;
-    struct bpf_load_map_def def;
-};
 
 template <typename T>
 static vector<T> vector_of(ELFIO::section* sec) {
@@ -41,88 +25,59 @@ static vector<T> vector_of(ELFIO::section* sec) {
     return {(T*)data, (T*)(data + size)};
 }
 
-int create_map_crab(uint32_t map_type, uint32_t key_size, uint32_t value_size, uint32_t max_entries) {
-    if (map_type == 12 || map_type == 13) {
+int create_map_crab(const EbpfMapType& map_type, uint32_t key_size, uint32_t value_size, uint32_t max_entries, ebpf_verifier_options_t options) {
+    if (map_type.is_value_map_fd) {
+        // Map-in-map is not yet supported.
         return -1;
     }
-    return (value_size << 14) + (key_size << 6); // + i;
+    if ((map_type.is_array && key_size != 4) || (key_size > (1 << 8)))
+        throw std::runtime_error("bad map key size " + std::to_string(key_size));
+    if (value_size > (1 << (31 - 8)))
+        throw std::runtime_error("bad map value size " + std::to_string(value_size));
+    int res = (value_size << 8) + key_size;
+    return res;
 }
 
-static BpfProgType section_to_progtype(const std::string& section, const std::string& path) {
-    // linux only deduces from section, but cilium and cilium_test have this information
-    // in the filename:
-    // * cilium/bpf_xdp.o:from-netdev is XDP
-    // * bpf_cilium_test/bpf_lb-DLB_L3.o:from-netdev is SK_SKB
-    if (path.find("cilium") != std::string::npos) {
-        if (path.find("xdp") != std::string::npos)
-            return BpfProgType::XDP;
-        if (path.find("lxc") != std::string::npos)
-            return BpfProgType::SCHED_CLS;
+EbpfMapDescriptor* find_map_descriptor(int map_fd) {
+    for (EbpfMapDescriptor& map : global_program_info.map_descriptors) {
+        if (map.original_fd == map_fd) {
+            return &map;
+        }
     }
-    static const std::unordered_map<std::string, BpfProgType> prefixes{
-        {"socket", BpfProgType::SOCKET_FILTER},
-        {"kprobe/", BpfProgType::KPROBE},
-        {"kretprobe/", BpfProgType::KPROBE},
-        {"tracepoint/", BpfProgType::TRACEPOINT},
-        {"raw_tracepoint/", BpfProgType::RAW_TRACEPOINT},
-        {"xdp", BpfProgType::XDP},
-        {"perf_section", BpfProgType::PERF_EVENT},
-        {"perf_event", BpfProgType::PERF_EVENT},
-        {"classifier", BpfProgType::SCHED_CLS},
-        {"action", BpfProgType::SCHED_ACT},
-        {"cgroup/skb", BpfProgType::CGROUP_SKB},
-        {"cgroup/sock", BpfProgType::CGROUP_SOCK},
-        {"cgroup/dev", BpfProgType::CGROUP_DEVICE},
-        {"lwt_in", BpfProgType::LWT_IN},
-        {"lwt_out", BpfProgType::LWT_OUT},
-        {"lwt_xmit", BpfProgType::LWT_XMIT},
-        {"lwt_seg6local", BpfProgType::LWT_SEG6LOCAL},
-        {"lirc_mode2", BpfProgType::LIRC_MODE2},
-        {"sockops", BpfProgType::SOCK_OPS},
-        {"sk_skb", BpfProgType::SK_SKB},
-        {"sk_msg", BpfProgType::SK_MSG},
-    };
-    for (const auto& [prefix, t] : prefixes) {
-        if (section.find(prefix) == 0)
-            return t;
-    }
-    return BpfProgType::SOCKET_FILTER;
+    return nullptr;
 }
 
-vector<raw_program> read_elf(const std::string& path, const std::string& desired_section, MapFd* fd_alloc) {
-    assert(fd_alloc != nullptr);
+vector<raw_program> read_elf(const std::string& path, const std::string& desired_section, const ebpf_verifier_options_t* options, const ebpf_platform_t* platform) {
+    if (options == nullptr)
+        options = &ebpf_verifier_default_options;
     ELFIO::elfio reader;
     if (!reader.load(path)) {
-        std::cerr << "Can't find or process ELF file " << path << "\n";
-        exit(2);
+        struct stat st;
+        if (stat(path.c_str(), &st)) {
+            throw std::runtime_error(string(strerror(errno)) + " opening " + path);
+        }
+        throw std::runtime_error(string("Can't process ELF file ") + path);
     }
 
-    program_info info{};
-    auto mapdefs = vector_of<bpf_load_map_def>(reader.sections["maps"]);
-    for (auto s : mapdefs) {
-        info.map_defs.emplace_back(map_def{
-            .original_fd = fd_alloc(s.type, s.key_size, s.value_size, s.max_entries),
-            .type = MapType{s.type},
-            .key_size = s.key_size,
-            .value_size = s.value_size,
-        });
-    }
-    for (size_t i = 0; i < mapdefs.size(); i++) {
-        unsigned int inner = mapdefs[i].inner_map_idx;
-        info.map_defs[i].inner_map_fd = info.map_defs[inner].original_fd;
+    program_info info{platform};
+
+    ELFIO::section* maps_section = reader.sections["maps"];
+    if (maps_section) {
+        platform->parse_maps_section(info.map_descriptors, maps_section->get_data(), maps_section->get_size(), platform, *options);
     }
 
     ELFIO::const_symbol_section_accessor symbols{reader, reader.sections[".symtab"]};
-    auto read_reloc_value = [&symbols](int symbol) -> int {
+    auto read_reloc_value = [&symbols,platform](int symbol) -> size_t {
         string symbol_name;
         ELFIO::Elf64_Addr value{};
-        ELFIO::Elf_Xword size;
-        unsigned char bind;
-        unsigned char type;
-        ELFIO::Elf_Half section_index;
-        unsigned char other;
+        ELFIO::Elf_Xword size{};
+        unsigned char bind{};
+        unsigned char type{};
+        ELFIO::Elf_Half section_index{};
+        unsigned char other{};
         symbols.get_symbol(symbol, symbol_name, value, size, bind, type, section_index, other);
-        return value / sizeof(bpf_load_map_def);
+
+        return value / platform->map_record_size;
     };
 
     vector<raw_program> res;
@@ -136,8 +91,7 @@ vector<raw_program> read_elf(const std::string& path, const std::string& desired
         if (name != ".text" && name.find('.') == 0) {
             continue;
         }
-        info.program_type = section_to_progtype(name, path);
-        info.descriptor = get_descriptor(info.program_type);
+        info.type = platform->get_program_type(name, path);
         if (section->get_size() == 0)
             continue;
         raw_program prog{path, name, vector_of<ebpf_inst>(section), info};
@@ -145,36 +99,64 @@ vector<raw_program> read_elf(const std::string& path, const std::string& desired
         if (!prelocs)
             prelocs = reader.sections[string(".rela") + name];
 
-        // // std::vector<int> updated_fds = sort_maps_by_size(info.map_defs);
-        // for (auto n : updated_fds) {
-        //     std::cout << "old=" << info.map_defs[n].original_fd << ", "
-        //               << "new=" << n << ", "
-        //               << "size=" << info.map_defs[n].value_size << "\n";
-        // }
         if (prelocs) {
             ELFIO::const_relocation_section_accessor reloc{reader, prelocs};
             ELFIO::Elf64_Addr offset;
             ELFIO::Elf_Word symbol{};
             ELFIO::Elf_Word type;
             ELFIO::Elf_Sxword addend;
-            for (unsigned int i = 0; i < reloc.get_entries_num(); i++) {
+
+            // Below, only relocations of symbols located in the maps section are allowed,
+            // so if there are relocations there needs to be a "maps" section.
+            if (reloc.get_entries_num() && !maps_section) {
+                throw std::runtime_error(string("Can't find any maps sections in file ") + path);
+            }
+
+            for (ELFIO::Elf_Xword i = 0; i < reloc.get_entries_num(); i++) {
                 if (reloc.get_entry(i, offset, symbol, type, addend)) {
-                    auto& inst = prog.prog[offset / sizeof(ebpf_inst)];
+                    ebpf_inst& inst = prog.prog[offset / sizeof(ebpf_inst)];
+
+                    string symbol_name;
+                    ELFIO::Elf64_Addr symbol_value{};
+                    unsigned char symbol_bind{};
+                    unsigned char symbol_type{};
+                    ELFIO::Elf_Half symbol_section_index{};
+                    unsigned char symbol_other{};
+                    ELFIO::Elf_Xword symbol_size{};
+
+                    symbols.get_symbol(symbol, symbol_name, symbol_value, symbol_size, symbol_bind, symbol_type,
+                                       symbol_section_index, symbol_other);
+
+                    // Only perform relocation for symbols located in the maps section.
+                    if (symbol_section_index != maps_section->get_index()) {
+                        throw std::runtime_error(string("Unresolved external symbol " + symbol_name +
+                                                        " at location " + std::to_string(offset / sizeof(ebpf_inst))));
+                    }
+
+                    // Only permit loading the address of the map.
+                    if ((inst.opcode & INST_CLS_MASK) != INST_CLS_LD)
+                    {
+                        throw std::runtime_error(string("Illegal operation on symbol " + symbol_name +
+                                                        " at location " + std::to_string(offset / sizeof(ebpf_inst))));
+                    }
                     inst.src = 1; // magic number for LoadFd
-                                  // if (fd_alloc == allocate_fds) {
-                                  //     std::cout << read_reloc_value(symbol) << "=" <<
-                    //     info.map_defs[updated_fds.at(read_reloc_value(symbol))].value_size << "\n"; inst.imm =
-                    //     updated_fds.at(read_reloc_value(symbol));
-                    // } else {
-                    inst.imm = info.map_defs[read_reloc_value(symbol)].original_fd;
-                    // }
+
+                    size_t reloc_value = read_reloc_value(symbol);
+                    if (reloc_value >= info.map_descriptors.size()) {
+                        throw std::runtime_error(string("Bad reloc value (") + std::to_string(reloc_value) + "). "
+                                                 + "Make sure to compile with -O2.");
+                    }
+                    inst.imm = info.map_descriptors.at(reloc_value).original_fd;
                 }
             }
         }
         res.push_back(prog);
     }
     if (res.empty()) {
-        std::cerr << "Could not find relevant section!\n";
+        if (desired_section.empty()) {
+            throw std::runtime_error(string("Can't find any non-empty TEXT sections in file ") + path);
+        }
+        throw std::runtime_error(string("Can't find section ") + desired_section + " in file " + path);
     }
     return res;
 }

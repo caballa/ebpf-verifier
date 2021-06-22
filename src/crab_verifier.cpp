@@ -11,24 +11,18 @@
 #include <iostream>
 #include <map>
 #include <string>
-#include <tuple>
-#include <utility>
 #include <vector>
 
-#include <boost/lexical_cast.hpp>
-
-#include "crab/cfg.hpp"
 #include "crab/ebpf_domain.hpp"
 #include "crab/fwd_analyzer.hpp"
 
 #include "asm_syntax.hpp"
-#include "gpl/spec_type_descriptors.hpp"
+#include "crab_verifier.hpp"
 
 using std::string;
 
-using crab::linear_constraint_t;
-
-program_info global_program_info;
+thread_local program_info global_program_info;
+thread_local ebpf_verifier_options_t thread_local_options;
 
 // Numerical domains over integers
 //using sdbm_domain_t = crab::domains::SplitDBM;
@@ -39,54 +33,45 @@ struct checks_db final {
     std::map<label_t, std::vector<std::string>> m_db;
     int total_warnings{};
     int total_unreachable{};
+    int max_instruction_count{};
+    std::set<label_t> maybe_nonterminating;
 
     void add(const label_t& label, const std::string& msg) {
         m_db[label].emplace_back(msg);
     }
 
-    void add_warning(const label_t& label, const std::string& msg) { add(label,     msg); total_warnings++; }
-    void add_unreachable(const label_t& label, const std::string& msg) { add(label, msg); total_unreachable++; }
+    void add_warning(const label_t& label, const std::string& msg) {
+        add(label, msg);
+        total_warnings++;
+    }
+
+    void add_unreachable(const label_t& label, const std::string& msg) {
+        add(label, msg);
+        total_unreachable++;
+    }
+
+    void add_nontermination(const label_t& label) {
+        maybe_nonterminating.insert(label);
+        total_warnings++;
+    }
 
     checks_db() = default;
 };
 
-inline int first_num(const label_t& s) {
-    try {
-        return boost::lexical_cast<int>(s.substr(0, s.find_first_of(":+")));
-    } catch (...) {
-        std::cout << "bad label:" << s << "\n";
-        throw;
-    }
-}
-
-static std::vector<label_t> sorted_labels(cfg_t& cfg) {
-    std::vector<label_t> labels = cfg.labels();
-
-    std::sort(labels.begin(), labels.end(), [](const string& a, const string& b) {
-        if (first_num(a) < first_num(b))
-            return true;
-        if (first_num(a) > first_num(b))
-            return false;
-        return a < b;
-    });
-    return labels;
-}
-
-static checks_db generate_report(cfg_t& cfg,
+static checks_db generate_report(std::ostream& s,
+                                 cfg_t& cfg,
                                  crab::invariant_table_t& preconditions,
                                  crab::invariant_table_t& postconditions) {
     checks_db m_db;
-    for (const label_t& label : sorted_labels(cfg)) {
+    for (const label_t& label : cfg.sorted_labels()) {
         basic_block_t& bb = cfg.get_node(label);
 
-        if (global_options.print_invariants) {
-            std::cout << "\n" << preconditions.at(label) << "\n";
-            std::cout << bb;
-            std::cout << "\n" << postconditions.at(label) << "\n";
+        if (thread_local_options.print_invariants) {
+            s << "\nPreconditions : " << preconditions.at(label) << "\n";
+            s << bb;
+            s << "\nPostconditions: " << postconditions.at(label) << "\n";
         }
 
-        if (std::none_of(bb.begin(), bb.end(), [](const auto& s) { return std::holds_alternative<Assert>(s); }))
-            continue;
         ebpf_domain_t from_inv(preconditions.at(label));
         from_inv.set_require_check([&m_db, label](auto& inv, const linear_constraint_t& cst, const std::string& s) {
             if (inv.is_bottom())
@@ -102,57 +87,118 @@ static checks_db generate_report(cfg_t& cfg,
                 // TODO: add_error() if imply negation
                 m_db.add_warning(label, s);
             } else {
-                m_db.add_warning(label, s);
+                m_db.add_warning(label, std::string("assertion failed: ") + s);
             }
         });
 
-        for (const auto& statement : bb) {
-            bool pre_bot = from_inv.is_bottom();
-            std::visit(from_inv, statement);
-            if (!pre_bot && from_inv.is_bottom()) {
-                m_db.add_unreachable(label, "inv became bot after " + to_string(statement));
+        if (thread_local_options.check_termination) {
+            // Pinpoint the places where divergence might occur.
+            int min_instruction_count_upper_bound = INT_MAX;
+            for (const label_t& prev_label : bb.prev_blocks_set()) {
+                int instruction_count = preconditions.at(prev_label).get_instruction_count_upper_bound();
+                min_instruction_count_upper_bound = std::min(min_instruction_count_upper_bound, instruction_count);
             }
+
+            constexpr int max_instructions = 100000;
+            int instruction_count_upper_bound = from_inv.get_instruction_count_upper_bound();
+            if ((min_instruction_count_upper_bound < max_instructions) &&
+                (instruction_count_upper_bound >= max_instructions))
+                m_db.add_nontermination(label);
+
+            m_db.max_instruction_count = std::max(m_db.max_instruction_count, instruction_count_upper_bound);
+        }
+
+        bool pre_bot = from_inv.is_bottom();
+
+        from_inv(bb, thread_local_options.check_termination);
+
+        if (!pre_bot && from_inv.is_bottom()) {
+            m_db.add_unreachable(label, std::string("Code is unreachable after ") + to_string(bb.label()));
         }
     }
     return m_db;
 }
 
-template<typename F>
-auto timed_execution(F f) {
-    clock_t begin = clock();
-
-    const auto& res = f();
-
-    clock_t end = clock();
-
-    double elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-    return std::make_tuple(res, elapsed_secs);
-}
-
-static void print_report(const checks_db& db) {
-    std::cout << "\n";
+static void print_report(std::ostream& s, const checks_db& db, const InstructionSeq& prog) {
+    s << "\n";
     for (auto [label, messages] : db.m_db) {
-        std::cout << label << ":\n";
+        // See if there is an instruction with this label.
+        auto it = std::find_if(prog.begin(), prog.end(), [label](const LabeledInstruction& val) {
+            return (std::get<0>(val) == label);
+        });
+        if (it != std::end(prog)) {
+            print(prog, s, label);
+        } else {
+            s << label << ":\n";
+        }
+
         for (const auto& msg : messages)
-            std::cout << "  " << msg << "\n";
+            s << "  " << msg << "\n";
     }
-    std::cout << "\n";
-    std::cout << db.total_warnings << " warnings\n";
+    s << "\n";
+    if (!db.maybe_nonterminating.empty()) {
+        s << "Could not prove termination on join into: ";
+        for (const label_t& label : db.maybe_nonterminating) {
+            s << label << ", ";
+        }
+        s << "\n";
+    }
+    s << db.total_warnings << " errors\n";
 }
 
-std::tuple<bool, double> run_ebpf_analysis(cfg_t& cfg, program_info info) {
+static checks_db get_ebpf_report(std::ostream& s, cfg_t& cfg, program_info info, const ebpf_verifier_options_t* options) {
     global_program_info = std::move(info);
     crab::domains::clear_global_state();
+    variable_t::clear_thread_local_state();
+    thread_local_options = *options;
 
-    auto&& [report, elapsed_secs] = timed_execution([&] {
+    try {
         // Get dictionaries of preconditions and postconditions for each
         // basic block.
-        auto [preconditions, postconditions] = crab::run_forward_analyzer(cfg);
-        return generate_report(cfg, preconditions, postconditions);
-    });
+        auto [preconditions, postconditions] = crab::run_forward_analyzer(cfg, options->check_termination);
 
-    if (global_options.print_failures) {
-        print_report(report);
+        // Analyze the control-flow graph.
+        return generate_report(s, cfg, preconditions, postconditions);
+    } catch (std::runtime_error& e) {
+        // Convert verifier runtime_error exceptions to failure.
+        checks_db db;
+        db.add_warning(label_t::exit, e.what());
+        return db;
     }
-    return {report.total_warnings == 0, elapsed_secs};
+}
+
+/// Returned value is true if the program passes verification.
+bool run_ebpf_analysis(std::ostream& s, cfg_t& cfg, program_info info, const ebpf_verifier_options_t* options,
+                       ebpf_verifier_stats_t* stats) {
+    if (options == nullptr)
+        options = &ebpf_verifier_default_options;
+    checks_db report = get_ebpf_report(s, cfg, info, options);
+    if (stats) {
+        stats->total_unreachable = report.total_unreachable;
+        stats->total_warnings = report.total_warnings;
+        stats->max_instruction_count = report.max_instruction_count;
+    }
+    return (report.total_warnings == 0);
+}
+
+/// Returned value is true if the program passes verification.
+bool ebpf_verify_program(std::ostream& s, const InstructionSeq& prog, program_info info,
+                         const ebpf_verifier_options_t* options, ebpf_verifier_stats_t* stats) {
+    if (options == nullptr)
+        options = &ebpf_verifier_default_options;
+
+    // Convert the instruction sequence to a control-flow graph
+    // in a "passive", non-deterministic form.
+    cfg_t cfg = prepare_cfg(prog, info, !options->no_simplify);
+
+    checks_db report = get_ebpf_report(s, cfg, info, options);
+    if (options->print_failures) {
+        print_report(s, report, prog);
+    }
+    if (stats) {
+        stats->total_unreachable = report.total_unreachable;
+        stats->total_warnings = report.total_warnings;
+        stats->max_instruction_count = report.max_instruction_count;
+    }
+    return (report.total_warnings == 0);
 }

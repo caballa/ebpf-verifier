@@ -9,59 +9,93 @@ if (IS_DIRECTORY "${PROJECT_SOURCE_DIR}/.git")
        DESTINATION "${PROJECT_SOURCE_DIR}/.git/hooks")
 endif ()
 
-set(CMAKE_CXX_STANDARD 17)
+if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR
+    "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+  find_package(Boost REQUIRED)
+  set(CMAKE_CXX_STANDARD 17)
+elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
+  find_program(NUGET nuget)
+  if (NOT NUGET)
+    message("ERROR: You must first install nuget.exe from https://www.nuget.org/downloads")
+  else ()
+    exec_program(${NUGET} ARGS install "Boost" -Version 1.75.0 -ExcludeVersion -OutputDirectory ${CMAKE_BINARY_DIR}/packages)
+  endif()
+  set(Boost_INCLUDE_DIRS ${CMAKE_BINARY_DIR}/packages/boost/lib/native/include)
 
-find_package(Boost REQUIRED)
-
-find_library(GMP REQUIRED)
+  # MSVC's C++17 standard option doesn't actually support all the C++17
+  # features we use, but its "latest" option does.  However, cmake can't
+  # deal with that here, so we set it below.
+endif ()
 
 include_directories(./external)
 include_directories(./src)
-include_directories(${GMP_LIB_INCLUDE_DIRS})
 include_directories(${Boost_INCLUDE_DIRS})
-link_directories(${GMP_LIB_LIBRARY_DIRS})
 link_directories(${Boost_LIBRARY_DIRS})
 
-file(GLOB ALL_SRC
+file(GLOB LIB_SRC
         "./src/*.cpp"
-        "./src/gpl/*.cpp"
         "./src/crab/*.cpp"
         "./src/crab_utils/*.cpp"
+        "./src/linux/gpl/*.cpp"
+        "./src/linux/linux_platform.cpp"
         )
 
 file(GLOB ALL_TEST
         "./src/test/*.cpp"
         )
 
-set(COMMON_FLAGS -Wall -Wfatal-errors -DSIZEOF_VOID_P=8 -DSIZEOF_LONG=8)
-set(DEBUG_FLAGS -O0 -g3)
-set(RELEASE_FLAGS -O2 -flto)
-set(SANITIZE_FLAGS -fsanitize=address -O1 -fno-omit-frame-pointer)
+if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" OR
+    "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+  set(COMMON_FLAGS -Wall -Wfatal-errors -DSIZEOF_VOID_P=8 -DSIZEOF_LONG=8)
+  set(DEBUG_FLAGS -O0 -g3)
+  set(RELEASE_FLAGS -O2 -flto)
+  set(SANITIZE_FLAGS -fsanitize=address -O1 -fno-omit-frame-pointer)
+elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++latest")
 
-add_executable(check src/main/check.cpp ${ALL_SRC})
-add_executable(tests ${ALL_TEST} ${ALL_SRC})
+  # Make debug builds use static C runtime libs to avoid having
+  # to install them.  Release builds don't need this because
+  # the release DLLs are included in Windows.
+  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /MTd")
+endif ()
+
+add_library(ebpfverifier ${LIB_SRC})
+add_executable(check src/main/check.cpp src/main/linux_verifier.cpp)
+add_executable(tests ${ALL_TEST})
 
 set_target_properties(check
         PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/..")
 
-
 set_target_properties(tests
         PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/..")
 
+target_compile_options(ebpfverifier PRIVATE ${COMMON_FLAGS})
+target_compile_options(ebpfverifier PUBLIC "$<$<CONFIG:DEBUG>:${DEBUG_FLAGS}>")
+target_compile_options(ebpfverifier PUBLIC "$<$<CONFIG:RELEASE>:${RELEASE_FLAGS}>")
+target_compile_options(ebpfverifier PUBLIC "$<$<CONFIG:SANITIZE>:${SANITIZE_FLAGS}>")
+
+set_property(TARGET ebpfverifier PROPERTY VS_PACKAGE_REFERENCES "Boost_1.75.5")
+
+# CMake derives a Visual Studio project GUID from the file path but can be overridden via a property
+# (see https://gitlab.kitware.com/cmake/cmake/-/commit/c85367f4).  Using a non-constant GUID
+# can cause problems if other projects/repos want to reference the ebpfverifier vcxproj file,
+# so we force a constant GUID here.
+set(ebpfverifier_GUID_CMAKE "7d5b4e68-c0fa-3f86-9405-f6400219b440" CACHE INTERNAL "Project GUID")
 
 target_compile_options(check PRIVATE ${COMMON_FLAGS})
 target_compile_options(check PUBLIC "$<$<CONFIG:DEBUG>:${DEBUG_FLAGS}>")
 target_compile_options(check PUBLIC "$<$<CONFIG:RELEASE>:${RELEASE_FLAGS}>")
 target_compile_options(check PUBLIC "$<$<CONFIG:SANITIZE>:${SANITIZE_FLAGS}>")
-
-target_link_libraries(check PRIVATE gmp)
-
+target_link_libraries(check PRIVATE ebpfverifier)
 
 target_compile_options(tests PRIVATE ${COMMON_FLAGS})
 target_compile_options(tests PUBLIC "$<$<CONFIG:DEBUG>:${DEBUG_FLAGS}>")
 target_compile_options(tests PUBLIC "$<$<CONFIG:RELEASE>:${RELEASE_FLAGS}>")
 target_compile_options(tests PUBLIC "$<$<CONFIG:SANITIZE>:${SANITIZE_FLAGS}>")
+target_link_libraries(tests PRIVATE ebpfverifier)
 
-target_link_libraries(tests PRIVATE gmp)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+target_link_libraries(tests PRIVATE Threads::Threads)

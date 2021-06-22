@@ -5,13 +5,10 @@
 #include <iostream>
 #include <string>
 #include <vector>
-#include <tuple>
 
-#include "linux_ebpf.hpp"
+#include "ebpf_vm_isa.hpp"
 
-#include "gpl/spec_prototypes.hpp"
-
-#include "asm_syntax.hpp"
+#include "asm_unmarshal.hpp"
 
 using std::string;
 using std::vector;
@@ -39,13 +36,14 @@ uint8_t width_to_opcode(int width) {
 }
 
 template <typename T>
-void compare(string field, T actual, T expected) {
+void compare(const string& field, T actual, T expected) {
     if (actual != expected)
         std::cerr << field << ": (actual) " << std::hex << (int)actual << " != " << (int)expected << " (expected)\n";
 }
 
 struct InvalidInstruction : std::invalid_argument {
-    explicit InvalidInstruction(const char* what) : std::invalid_argument{what} {}
+    size_t pc;
+    explicit InvalidInstruction(size_t pc, const char* what) : std::invalid_argument{what}, pc{pc} {}
 };
 
 struct UnsupportedMemoryMode : std::invalid_argument {
@@ -84,11 +82,12 @@ static auto getMemWidth(uint8_t opcode) -> int {
 
 struct Unmarshaller {
     vector<vector<string>>& notes;
+    const ebpf_platform_t* platform;
     void note(const string& what) { notes.back().emplace_back(what); }
     void note_next_pc() { notes.emplace_back(); }
-    explicit Unmarshaller(vector<vector<string>>& notes) : notes{notes} { note_next_pc(); }
+    explicit Unmarshaller(vector<vector<string>>& notes, const ebpf_platform_t* platform) : notes{notes}, platform{platform} { note_next_pc(); }
 
-    auto getAluOp(ebpf_inst inst) -> std::variant<Bin::Op, Un::Op> {
+    auto getAluOp(size_t pc, ebpf_inst inst) -> std::variant<Bin::Op, Un::Op> {
         switch ((inst.opcode >> 4) & 0xF) {
         case 0x0: return Bin::Op::ADD;
         case 0x1: return Bin::Op::SUB;
@@ -111,16 +110,16 @@ struct Unmarshaller {
             case 16: return Un::Op::LE16;
             case 32:
                 if ((inst.opcode & INST_CLS_MASK) == INST_CLS_ALU64)
-                    throw InvalidInstruction("invalid endian immediate 32 for 64 bit instruction");
+                    throw InvalidInstruction(pc, "invalid endian immediate 32 for 64 bit instruction");
                 return Un::Op::LE32;
             case 64:
                 if ((inst.opcode & INST_CLS_MASK) == INST_CLS_ALU)
-                    throw InvalidInstruction("invalid endian immediate 64 for 32 bit instruction");
+                    throw InvalidInstruction(pc, "invalid endian immediate 64 for 32 bit instruction");
                 return Un::Op::LE64;
             default: note("invalid endian immediate; falling back to 64"); return Un::Op::LE64;
             }
-        case 0xe: throw InvalidInstruction{"Invalid ALU op 0xe"};
-        case 0xf: throw InvalidInstruction{"Invalid ALU op 0xf"};
+        case 0xe: throw InvalidInstruction{pc, "invalid ALU op 0xe"};
+        case 0xf: throw InvalidInstruction{pc, "invalid ALU op 0xf"};
         }
         return {};
     }
@@ -139,7 +138,7 @@ struct Unmarshaller {
         }
     }
 
-    static auto getJmpOp(uint8_t opcode) -> Condition::Op {
+    static auto getJmpOp(size_t pc, uint8_t opcode) -> Condition::Op {
         using Op = Condition::Op;
         switch ((opcode >> 4) & 0xF) {
         case 0x0: return {}; // goto
@@ -156,7 +155,7 @@ struct Unmarshaller {
         case 0xb: return Op::LE;
         case 0xc: return Op::SLT;
         case 0xd: return Op::SLE;
-        case 0xe: throw InvalidInstruction{"Invalid JMP op 0xe"};
+        case 0xe: throw InvalidInstruction(pc, "invalid JMP op 0xe");
         }
         return {};
     }
@@ -194,7 +193,7 @@ struct Unmarshaller {
             assert(!(isLoad && isImm));
             uint8_t basereg = isLoad ? inst.src : inst.dst;
 
-            if (basereg == R10_STACK_POINTER && (inst.offset + opcode_to_width(inst.opcode) > 0 || inst.offset < -STACK_SIZE)) {
+            if (basereg == R10_STACK_POINTER && (inst.offset + opcode_to_width(inst.opcode) > 0 || inst.offset < -EBPF_STACK_SIZE)) {
                 note("Stack access out of bounds");
             }
             auto res = Mem{
@@ -230,23 +229,23 @@ struct Unmarshaller {
         return {};
     }
 
-    auto makeAluOp(ebpf_inst inst) -> Instruction {
+    auto makeAluOp(size_t pc, ebpf_inst inst) -> Instruction {
         if (inst.dst == R10_STACK_POINTER)
             note("Invalid target r10");
         return std::visit(overloaded{[&](Un::Op op) -> Instruction { return Un{.op = op, .dst = Reg{inst.dst}}; },
                                      [&](Bin::Op op) -> Instruction {
                                          Bin res{
                                              .op = op,
-                                             .is64 = (inst.opcode & INST_CLS_MASK) == INST_CLS_ALU64,
                                              .dst = Reg{inst.dst},
                                              .v = getBinValue(inst),
+                                             .is64 = (inst.opcode & INST_CLS_MASK) == INST_CLS_ALU64,
                                          };
                                          if (op == Bin::Op::DIV || op == Bin::Op::MOD)
                                              if (std::holds_alternative<Imm>(res.v) && std::get<Imm>(res.v).v == 0)
                                                  note("division by zero");
                                          return res;
                                      }},
-                          getAluOp(inst));
+                          getAluOp(pc, inst));
     }
 
     auto makeLddw(ebpf_inst inst, int32_t next_imm, const vector<ebpf_inst>& insts, pc_t pc) -> Instruction {
@@ -266,57 +265,64 @@ struct Unmarshaller {
             note("invalid LDDW");
         return Bin{
             .op = Bin::Op::MOV,
-            .is64 = true,
             .dst = Reg{inst.dst},
             .v = Imm{merge(inst.imm, next_imm)},
+            .is64 = true,
             .lddw = true,
         };
     }
 
-    static ArgSingle::Kind toArgSingleKind(Arg t) {
+    static ArgSingle::Kind toArgSingleKind(ebpf_argument_type_t t) {
         switch (t) {
-        case Arg::ANYTHING: return ArgSingle::Kind::ANYTHING;
-        case Arg::CONST_SHARED_PTR: return ArgSingle::Kind::MAP_FD;
-        case Arg::PTR_TO_MAP_KEY: return ArgSingle::Kind::PTR_TO_MAP_KEY;
-        case Arg::PTR_TO_MAP_VALUE: return ArgSingle::Kind::PTR_TO_MAP_VALUE;
-        case Arg::PTR_TO_CTX: return ArgSingle::Kind::PTR_TO_CTX;
+        case EBPF_ARGUMENT_TYPE_ANYTHING: return ArgSingle::Kind::ANYTHING;
+        case EBPF_ARGUMENT_TYPE_PTR_TO_MAP: return ArgSingle::Kind::MAP_FD;
+        case EBPF_ARGUMENT_TYPE_PTR_TO_MAP_KEY: return ArgSingle::Kind::PTR_TO_MAP_KEY;
+        case EBPF_ARGUMENT_TYPE_PTR_TO_MAP_VALUE: return ArgSingle::Kind::PTR_TO_MAP_VALUE;
+        case EBPF_ARGUMENT_TYPE_PTR_TO_CTX: return ArgSingle::Kind::PTR_TO_CTX;
         default: break;
         }
         return {};
     }
-    static ArgPair::Kind toArgPairKind(Arg t) {
+    static ArgPair::Kind toArgPairKind(ebpf_argument_type_t t) {
         switch (t) {
-        case Arg::PTR_TO_MEM_OR_NULL: return ArgPair::Kind::PTR_TO_MEM_OR_NULL;
-        case Arg::PTR_TO_MEM: return ArgPair::Kind::PTR_TO_MEM;
-        case Arg::PTR_TO_UNINIT_MEM: return ArgPair::Kind::PTR_TO_UNINIT_MEM;
+        case EBPF_ARGUMENT_TYPE_PTR_TO_MEM_OR_NULL: return ArgPair::Kind::PTR_TO_MEM_OR_NULL;
+        case EBPF_ARGUMENT_TYPE_PTR_TO_MEM: return ArgPair::Kind::PTR_TO_MEM;
+        case EBPF_ARGUMENT_TYPE_PTR_TO_UNINIT_MEM: return ArgPair::Kind::PTR_TO_UNINIT_MEM;
         default: break;
         }
         return {};
     }
 
-    static auto makeCall(int32_t imm) {
-        bpf_func_proto proto = get_prototype(imm);
+    static auto makeCall(const ebpf_platform_t* platform, int32_t imm) {
+        EbpfHelperPrototype proto = platform->get_helper_prototype(imm);
         Call res;
         res.func = imm;
         res.name = proto.name;
-        res.pkt_access = proto.pkt_access;
-        res.returns_map = proto.ret_type == Ret::PTR_TO_MAP_VALUE_OR_NULL;
-        std::array<Arg, 7> args = {{Arg::DONTCARE, proto.arg1_type, proto.arg2_type, proto.arg3_type, proto.arg4_type,
-                                    proto.arg5_type, Arg::DONTCARE}};
+        res.returns_map = proto.return_type == EBPF_RETURN_TYPE_PTR_TO_MAP_VALUE_OR_NULL;
+        std::array<ebpf_argument_type_t, 7> args = {{
+            EBPF_ARGUMENT_TYPE_DONTCARE,
+            proto.argument_type[0],
+            proto.argument_type[1],
+            proto.argument_type[2],
+            proto.argument_type[3],
+            proto.argument_type[4],
+            EBPF_ARGUMENT_TYPE_DONTCARE}};
         for (size_t i = 1; i < args.size() - 1; i++) {
             switch (args[i]) {
-            case Arg::DONTCARE: return res;
-            case Arg::ANYTHING:
-            case Arg::CONST_SHARED_PTR:
-            case Arg::PTR_TO_MAP_KEY:
-            case Arg::PTR_TO_MAP_VALUE:
-            case Arg::PTR_TO_CTX: res.singles.push_back({toArgSingleKind(args[i]), Reg{(uint8_t)i}}); break;
-            case Arg::CONST_SIZE: assert(false); continue;
-            case Arg::CONST_SIZE_OR_ZERO: assert(false); continue;
-            case Arg::PTR_TO_MEM_OR_NULL:
-            case Arg::PTR_TO_MEM:
-            case Arg::PTR_TO_UNINIT_MEM:
-                bool can_be_zero = (args[i + 1] == Arg::CONST_SIZE_OR_ZERO);
+            case EBPF_ARGUMENT_TYPE_DONTCARE: return res;
+            case EBPF_ARGUMENT_TYPE_ANYTHING:
+            case EBPF_ARGUMENT_TYPE_PTR_TO_MAP:
+            case EBPF_ARGUMENT_TYPE_PTR_TO_MAP_KEY:
+            case EBPF_ARGUMENT_TYPE_PTR_TO_MAP_VALUE:
+            case EBPF_ARGUMENT_TYPE_PTR_TO_CTX:
+                res.singles.push_back({toArgSingleKind(args[i]), Reg{(uint8_t)i}});
+                break;
+            case EBPF_ARGUMENT_TYPE_CONST_SIZE: assert(false); continue;
+            case EBPF_ARGUMENT_TYPE_CONST_SIZE_OR_ZERO: assert(false); continue;
+            case EBPF_ARGUMENT_TYPE_PTR_TO_MEM_OR_NULL:
+            case EBPF_ARGUMENT_TYPE_PTR_TO_MEM:
+            case EBPF_ARGUMENT_TYPE_PTR_TO_UNINIT_MEM:
+                bool can_be_zero = (args[i + 1] == EBPF_ARGUMENT_TYPE_CONST_SIZE_OR_ZERO);
                 res.pairs.push_back({toArgPairKind(args[i]), Reg{(uint8_t)i}, Reg{(uint8_t)(i + 1)}, can_be_zero});
                 i++;
                 break;
@@ -327,9 +333,9 @@ struct Unmarshaller {
     auto makeJmp(ebpf_inst inst, const vector<ebpf_inst>& insts, pc_t pc) -> Instruction {
         switch ((inst.opcode >> 4) & 0xF) {
         case 0x8:
-            if (!is_valid_prototype(inst.imm))
-                note("invalid function id ");
-            return makeCall(inst.imm);
+            if (!platform->is_helper_usable(inst.imm))
+                throw InvalidInstruction(pc, "invalid helper function id");
+            return makeCall(platform, inst.imm);
         case 0x9: return Exit{};
         default: {
             pc_t new_pc = pc + 1 + inst.offset;
@@ -340,14 +346,14 @@ struct Unmarshaller {
 
             auto cond = inst.opcode == INST_OP_JA ? std::optional<Condition>{}
                                                   : Condition{
-                                                        .op = getJmpOp(inst.opcode),
+                                                        .op = getJmpOp(pc, inst.opcode),
                                                         .left = Reg{inst.dst},
                                                         .right = (inst.opcode & INST_SRC_REG) ? (Value)Reg{inst.src}
                                                                                               : Imm{(uint32_t)inst.imm},
                                                     };
             return Jmp{
                 .cond = cond,
-                .target = std::to_string(new_pc),
+                .target = label_t{new_pc},
             };
         }
         }
@@ -356,10 +362,10 @@ struct Unmarshaller {
     vector<LabeledInstruction> unmarshal(vector<ebpf_inst> const& insts) {
         vector<LabeledInstruction> prog;
         int exit_count = 0;
-        if (insts.size() == 0) {
+        if (insts.empty()) {
             throw std::invalid_argument("Zero length programs are not allowed");
         }
-        for (pc_t pc = 0; pc < insts.size();) {
+        for (size_t pc = 0; pc < insts.size();) {
             ebpf_inst inst = insts[pc];
             Instruction new_ins;
             bool lddw = false;
@@ -368,7 +374,7 @@ struct Unmarshaller {
             case INST_CLS_LD:
                 if (inst.opcode == INST_OP_LDDW_IMM) {
                     uint32_t next_imm = pc < insts.size() - 1 ? insts[pc + 1].imm : 0;
-                    new_ins = makeLddw(inst, next_imm, insts, pc);
+                    new_ins = makeLddw(inst, next_imm, insts, static_cast<pc_t>(pc));
                     lddw = true;
                     break;
                 }
@@ -378,10 +384,10 @@ struct Unmarshaller {
             case INST_CLS_STX: new_ins = makeMemOp(inst); break;
 
             case INST_CLS_ALU:
-            case INST_CLS_ALU64: new_ins = makeAluOp(inst); break;
+            case INST_CLS_ALU64: new_ins = makeAluOp(pc, inst); break;
 
             case INST_CLS_JMP: {
-                new_ins = makeJmp(inst, insts, pc);
+                new_ins = makeJmp(inst, insts, static_cast<pc_t>(pc));
                 if (std::holds_alternative<Exit>(new_ins)) {
                     fallthrough = false;
                     exit_count++;
@@ -393,7 +399,7 @@ struct Unmarshaller {
                 break;
             }
 
-            case INST_CLS_UNUSED: throw InvalidInstruction{"Invalid class 0x6"};
+            case INST_CLS_UNUSED: throw InvalidInstruction(pc, "invalid class 0x6");
             }
             /*
             vector<ebpf_inst> marshalled = marshal(new_ins[0], pc);
@@ -410,7 +416,7 @@ struct Unmarshaller {
             */
             if (pc == insts.size() - 1 && fallthrough)
                 note("fallthrough in last instruction");
-            prog.emplace_back(std::to_string(pc), new_ins);
+            prog.emplace_back(label_t(static_cast<int>(pc)), new_ins);
             pc++;
             note_next_pc();
             if (lddw) {
@@ -425,11 +431,13 @@ struct Unmarshaller {
 };
 
 std::variant<InstructionSeq, std::string> unmarshal(const raw_program& raw_prog, vector<vector<string>>& notes) {
+    global_program_info = raw_prog.info;
     try {
-        return Unmarshaller{notes}.unmarshal(raw_prog.prog);
+        return Unmarshaller{notes, raw_prog.info.platform}.unmarshal(raw_prog.prog);
     } catch (InvalidInstruction& arg) {
-        std::cerr << arg.what() << "\n";
-        return arg.what();
+        std::ostringstream ss;
+        ss << arg.pc << ": " << arg.what() << "\n";
+        return ss.str();
     }
 }
 

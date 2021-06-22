@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "crab_utils/debug.hpp"
 #include "asm_syntax.hpp"
 #include "crab/cfg.hpp"
 
@@ -36,21 +37,21 @@ static bool has_fall(Instruction ins) {
 
 /// Convert an instruction sequence to a control-flow graph (CFG).
 static cfg_t instruction_seq_to_cfg(const InstructionSeq& insts) {
-    string exit_label;
-    for (const auto& [label, inst] : insts) {
-        if (std::holds_alternative<Exit>(inst))
-            exit_label = label;
-    }
-    if (exit_label.empty())
-        throw std::runtime_error("no exit");
-    cfg_t cfg("0", exit_label);
+    cfg_t cfg;
     std::optional<label_t> falling_from = {};
+    bool first = true;
     for (const auto& [label, inst] : insts) {
 
         if (std::holds_alternative<Undefined>(inst))
             continue;
 
         auto& bb = cfg.insert(label);
+
+        if (first) {
+            first = false;
+            cfg.get_node(cfg.entry_label()) >> bb;
+        }
+
         bb.insert(inst);
         if (falling_from) {
             cfg.get_node(*falling_from) >> bb;
@@ -61,9 +62,13 @@ static cfg_t instruction_seq_to_cfg(const InstructionSeq& insts) {
         auto jump_target = get_jump(inst);
         if (jump_target)
             bb >> cfg.insert(*jump_target);
+
+        if (std::holds_alternative<Exit>(inst))
+            bb >> cfg.get_node(cfg.exit_label());
     }
     if (falling_from)
         throw std::invalid_argument{"fallthrough in last instruction"};
+
     return cfg;
 }
 
@@ -107,7 +112,7 @@ static vector<label_t> unique(const std::pair<T, T>& be) {
 /// simultaneously, and are replaced by Assume instructions
 /// immediately after the branch.
 static cfg_t to_nondet(const cfg_t& cfg) {
-    cfg_t res(cfg.entry(), cfg.exit());
+    cfg_t res;
     for (auto const& [this_label, bb] : cfg) {
         basic_block_t& newbb = res.insert(this_label);
 
@@ -117,27 +122,30 @@ static cfg_t to_nondet(const cfg_t& cfg) {
             }
         }
 
-        auto [pb, pe] = bb.prev_blocks();
-        for (const label_t& prev_label : vector<label_t>(pb, pe)) {
-            bool is_one = unique(cfg.get_node(prev_label).next_blocks()).size() > 1;
-            basic_block_t& pbb = res.insert(is_one ? prev_label + ":" + this_label : prev_label);
+        for (const label_t& prev_label : bb.prev_blocks_set()) {
+            bool is_one = cfg.get_node(prev_label).next_blocks_set().size() > 1;
+            basic_block_t& pbb = res.insert(is_one ? label_t::make_jump(prev_label, this_label) : prev_label);
             pbb >> newbb;
         }
         // note the special case where we jump to fallthrough
-        auto nextlist = unique(bb.next_blocks());
+        auto nextlist = bb.next_blocks_set();
         if (nextlist.size() == 2) {
-            label_t mid_label = this_label + ":";
-            Condition cond = *std::get<Jmp>(*bb.rbegin()).cond;
+            label_t mid_label = this_label;
+            Jmp jmp = std::get<Jmp>(*bb.rbegin());
+
+            nextlist.erase(jmp.target);
+            label_t fallthrough = *nextlist.begin();
+
             vector<std::tuple<label_t, Condition>> jumps{
-                {*bb.next_blocks().first, cond},
-                {*std::next(bb.next_blocks().first), reverse(cond)},
+                {jmp.target, *jmp.cond},
+                {fallthrough, reverse(*jmp.cond)},
             };
             for (auto const& [next_label, cond1] : jumps) {
-                label_t l = mid_label + next_label;
-                basic_block_t& bb1 = res.insert(l);
-                bb1.insert<Assume>(cond1);
-                newbb >> bb1;
-                bb1 >> res.insert(next_label);
+                label_t jump_label = label_t::make_jump(mid_label, next_label);
+                basic_block_t& jump_bb = res.insert(jump_label);
+                jump_bb.insert<Assume>(cond1);
+                newbb >> jump_bb;
+                jump_bb >> res.insert(next_label);
             }
         } else {
             for (const auto& label : nextlist)
@@ -185,7 +193,6 @@ static std::string instype(Instruction ins) {
 
 std::vector<std::string> stats_headers() {
     return {
-        //"instructions",
         "basic_blocks", "joins",       "other",      "jumps",         "assign",  "arith",
         "load",         "store",       "load_store", "packet_access", "call_1",  "call_mem",
         "call_nomem",   "adjust_head", "map_in_map", "arith64",       "arith32",
@@ -200,7 +207,7 @@ std::map<std::string, int> collect_stats(const cfg_t& cfg) {
     for (const auto& this_label : cfg.labels()) {
         res["basic_blocks"]++;
         basic_block_t const& bb = cfg.get_node(this_label);
-        res["instructions"] += bb.size();
+
         for (Instruction ins : bb) {
             if (std::holds_alternative<LoadMapFd>(ins)) {
                 if (std::get<LoadMapFd>(ins).mapfd == -1) {

@@ -1,5 +1,5 @@
 // Copyright (c) Prevail Verifier contributors.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include <map>
@@ -32,8 +32,8 @@ inline std::ostream& operator<<(std::ostream& OS, const Stopwatch& sw) {
 }
 
 class CrabStats {
-    static std::map<std::string, unsigned> counters;
-    static std::map<std::string, Stopwatch> sw;
+    static thread_local std::map<std::string, unsigned> counters;
+    static thread_local std::map<std::string, Stopwatch> sw;
 
   public:
     static void reset();

@@ -1,29 +1,12 @@
 // Copyright (c) Prevail Verifier contributors.
-// SPDX-License-Identifier: MIT
-#include <algorithm>
-#include <bitset>
-#include <optional>
-#include <set>
-#include <utility>
-#include <vector>
-
-#include "boost/range/algorithm/set_algorithm.hpp"
-
-#include "crab/variable.hpp"
-
-#include "crab/interval.hpp"
-#include "crab/split_dbm.hpp"
-#include "crab_utils/patricia_trees.hpp"
-
-#include "dsl_syntax.hpp"
-#include "gpl/spec_type_descriptors.hpp"
+// SPDX-License-Identifier: Apache-2.0
 
 #include "crab/array_domain.hpp"
 
 namespace crab::domains {
 
 // We use a global array map
-array_map_t global_array_map;
+thread_local array_map_t global_array_map;
 
 // Return true if [symb_lb, symb_ub] may overlap with the cell,
 // where symb_lb and symb_ub are not constant expressions.
@@ -71,12 +54,13 @@ void clear_global_state() {
 }
 
 void offset_map_t::remove_cell(const cell_t& c) {
-    if (std::optional<cell_set_t> cells = _map.lookup(c.get_offset())) {
+    offset_t key = c.get_offset();
+    if (std::optional<cell_set_t> cells = _map[key]) {
         if ((*cells).erase(c) > 0) {
-            _map.remove(c.get_offset());
+            _map.erase(key);
             if (!(*cells).empty()) {
                 // a bit of a waste ...
-                _map.insert(c.get_offset(), *cells);
+                _map[key] = *cells;
             }
         }
     }
@@ -85,7 +69,7 @@ void offset_map_t::remove_cell(const cell_t& c) {
 [[nodiscard]]
 std::vector<cell_t> offset_map_t::get_overlap_cells_symbolic_offset(const NumAbsDomain& dom,
                                                                     const linear_expression_t& symb_lb,
-                                                                    const linear_expression_t& symb_ub) const {
+                                                                    const linear_expression_t& symb_ub) {
     std::vector<cell_t> out;
     for (auto it = _map.begin(), et = _map.end(); it != et; ++it) {
         const cell_set_t& o_cells = it->second;
@@ -119,21 +103,22 @@ std::vector<cell_t> offset_map_t::get_overlap_cells_symbolic_offset(const NumAbs
 }
 
 void offset_map_t::insert_cell(const cell_t& c) {
-    if (std::optional<cell_set_t> cells = _map.lookup(c.get_offset())) {
+    offset_t key = c.get_offset();
+    if (std::optional<cell_set_t> cells = _map[key]) {
         if ((*cells).insert(c).second) {
             // a bit of a waste ...
-            _map.remove(c.get_offset());
-            _map.insert(c.get_offset(), *cells);
+            _map.erase(key);
+            _map[key] = *cells;
         }
     } else {
         cell_set_t new_cells;
         new_cells.insert(c);
-        _map.insert(c.get_offset(), new_cells);
+        _map[key] = new_cells;
     }
 }
 
-std::optional<cell_t> offset_map_t::get_cell(offset_t o, unsigned size) const {
-    if (std::optional<cell_set_t> cells = _map.lookup(o)) {
+std::optional<cell_t> offset_map_t::get_cell(offset_t o, unsigned size) {
+    if (std::optional<cell_set_t> cells = _map[o]) {
         cell_t tmp(o, size);
         auto it = (*cells).find(tmp);
         if (it != (*cells).end()) {
@@ -183,7 +168,7 @@ std::vector<cell_t> offset_map_t::get_overlap_cells(offset_t o, unsigned size) {
         }
         upto_lb.push_back(lb_it->second);
 
-        for (int i = upto_lb.size() - 1; i >= 0; --i) {
+        for (int i = static_cast<int>(upto_lb.size() - 1); i >= 0; --i) {
             ///////
             // All the cells in upto_lb[i] have the same offset. They
             // just differ in the size.
@@ -254,7 +239,7 @@ std::vector<cell_t> offset_map_t::get_overlap_cells(offset_t o, unsigned size) {
     return out;
 }
 
-std::ostream& operator<<(std::ostream& o, const offset_map_t& m) {
+std::ostream& operator<<(std::ostream& o, offset_map_t& m) {
     if (m._map.empty()) {
         o << "empty";
     } else {
@@ -285,9 +270,9 @@ array_domain_t::kill_and_find_var(NumAbsDomain& inv, data_kind_t kind, const lin
         interval_t i_elem_size = inv.eval_interval(elem_size);
         std::optional<number_t> n_bytes = i_elem_size.singleton();
         if (n_bytes) {
-            unsigned size = (long)(*n_bytes);
+            unsigned int size = (unsigned int)(*n_bytes);
             // -- Constant index: kill overlapping cells
-            offset_t o((long)*n);
+            offset_t o((uint64_t)*n);
             cells = offset_map.get_overlap_cells(o, size);
             res = std::make_pair(o, size);
         }
@@ -308,11 +293,19 @@ array_domain_t::kill_and_find_var(NumAbsDomain& inv, data_kind_t kind, const lin
     return res;
 }
 
+bool array_domain_t::all_num(NumAbsDomain& inv, const linear_expression_t& lb, const linear_expression_t& ub) {
+    auto min_lb = inv.eval_interval(lb).lb().number();
+    auto max_ub = inv.eval_interval(ub).ub().number();
+    if (!min_lb || !max_ub || !min_lb->fits_sint() || !max_ub->fits_sint())
+        return false;
+    return this->num_bytes.all_num((int)*min_lb, (int)*max_ub);
+}
+
 std::optional<linear_expression_t> array_domain_t::load(NumAbsDomain& inv, data_kind_t kind, const linear_expression_t& i, int width) {
     interval_t ii = inv.eval_interval(i);
     if (std::optional<number_t> n = ii.singleton()) {
         offset_map_t& offset_map = lookup_array_map(kind);
-        long k = (long)*n;
+        int64_t k = (int64_t)*n;
         if (kind == data_kind_t::types) {
             auto [only_num, only_non_num] = num_bytes.uniformity(k, width);
             if (only_num) {
@@ -341,6 +334,19 @@ std::optional<linear_expression_t> array_domain_t::load(NumAbsDomain& inv, data_
                 precise if we choose between little- and big-endian.
             */
         }
+    } else if (kind == data_kind_t::types) {
+        // Check whether the kind is uniform across the entire interval.
+        auto lb = ii.lb().number();
+        auto ub = ii.ub().number();
+        if (lb.has_value() && ub.has_value()) {
+            z_number fullwidth = ub.value() - lb.value() + width;
+            if (lb.value().fits_uint() && fullwidth.fits_uint()) {
+                auto [only_num, only_non_num] = num_bytes.uniformity((unsigned int)lb.value(), (unsigned int)fullwidth);
+                if (only_num) {
+                    return T_NUM;
+                }
+            }
+        }
     } else {
         // TODO: we can be more precise here
         CRAB_WARN("array expansion: ignored array load because of non-constant array index ", i);
@@ -358,7 +364,7 @@ std::optional<variable_t> array_domain_t::store(NumAbsDomain& inv, data_kind_t k
         auto [offset, size] = *maybe_cell;
         if (kind == data_kind_t::types) {
             std::optional<number_t> t = inv.eval_interval(val).singleton();
-            if (t && (long)*t == T_NUM)
+            if (t && (int64_t)*t == T_NUM)
                 num_bytes.reset(offset, size);
             else
                 num_bytes.havoc(offset, size);
@@ -367,6 +373,34 @@ std::optional<variable_t> array_domain_t::store(NumAbsDomain& inv, data_kind_t k
         return v;
     }
     return {};
+}
+
+// Get a range of bits out of the middle of a key, starting at [begin] for a given length.
+offset_t radix_substr(const offset_t& key, int begin, int length)
+{
+    uint64_t mask;
+
+    if (length == offset_t::bitsize)
+        mask = 0;
+    else
+        mask = ((index_t)1) << length;
+
+    mask -= 1;
+    mask <<= offset_t::bitsize - length - begin;
+
+    index_t value = (((index_t)key) & mask) << begin;
+    return offset_t{value, length};
+}
+
+// Concatenate two bit patterns.
+offset_t radix_join(const offset_t& entry1, const offset_t& entry2)
+{
+    index_t value1 = (index_t)entry1;
+    index_t value2 = (index_t)entry2;
+    index_t value = value1 | (value2 >> entry1.prefix_length());
+    int prefix_length = entry1.prefix_length() + entry2.prefix_length();
+
+    return offset_t{value, prefix_length};
 }
 
 } // namespace crab::domains

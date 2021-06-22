@@ -1,5 +1,5 @@
 // Copyright (c) Prevail Verifier contributors.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include <memory>
@@ -7,9 +7,6 @@
 #include "crab_utils/safeint.hpp"
 #include "crab_utils/debug.hpp"
 // Adaptive sparse-set based weighted graph implementation
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-compare"
 
 namespace crab {
 
@@ -234,7 +231,7 @@ class AdaptGraph final {
             free_id.pop_back();
             is_free[v] = false;
         } else {
-            v = _succs.size();
+            v = static_cast<vert_id>(_succs.size());
             is_free.push_back(false);
             _succs.emplace_back();
             _preds.emplace_back();
@@ -243,7 +240,7 @@ class AdaptGraph final {
         return v;
     }
 
-    void growTo(vert_id v) {
+    void growTo(size_t v) {
         while (size() < v)
             new_vertex();
     }
@@ -386,11 +383,10 @@ class AdaptGraph final {
     std::vector<smap_t> _succs;
     std::vector<Wt> _ws;
 
-    int edge_count;
+    size_t edge_count;
 
     std::vector<int> is_free;
     std::vector<vert_id> free_id;
     std::vector<size_t> free_widx;
 };
 } // namespace crab
-#pragma GCC diagnostic pop

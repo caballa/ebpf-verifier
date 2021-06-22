@@ -7,9 +7,12 @@
 #include "asm_unmarshal.hpp"
 
 static void compare_marshal_unmarshal(const Instruction& ins, bool double_cmd = false) {
-    InstructionSeq parsed = std::get<InstructionSeq>(unmarshal(raw_program{"", "", marshal(ins, 0), {}}));
+    program_info info{.platform = &g_ebpf_platform_linux,
+                      .type = g_ebpf_platform_linux.get_program_type("unspec", "unspec")};
+    InstructionSeq parsed = std::get<InstructionSeq>(unmarshal(raw_program{"", "", marshal(ins, 0), info}));
     REQUIRE(parsed.size() == 1);
     auto [_, single] = parsed.back();
+    (void)_; // unused
     REQUIRE(single == ins);
 }
 
@@ -21,19 +24,19 @@ TEST_CASE("disasm_marshal", "[disasm][marshal]") {
                     Bin::Op::OR,  Bin::Op::AND, Bin::Op::LSH, Bin::Op::RSH, Bin::Op::ARSH, Bin::Op::XOR};
         SECTION("Reg src") {
             for (auto op : ops) {
-                compare_marshal_unmarshal(Bin{.op = op, .is64 = true, .dst = Reg{1}, .v = Reg{2}});
-                compare_marshal_unmarshal(Bin{.op = op, .is64 = false, .dst = Reg{1}, .v = Reg{2}});
+                compare_marshal_unmarshal(Bin{.op = op, .dst = Reg{1}, .v = Reg{2}, .is64 = true});
+                compare_marshal_unmarshal(Bin{.op = op, .dst = Reg{1}, .v = Reg{2}, .is64 = false});
             }
         }
         SECTION("Imm src") {
             for (auto op : ops) {
                 // .is64=true should fail?
-                compare_marshal_unmarshal(Bin{.op = op, .is64 = false, .dst = Reg{1}, .v = Imm{2}});
-                compare_marshal_unmarshal(Bin{.op = op, .is64 = true, .dst = Reg{1}, .v = Imm{2}});
+                compare_marshal_unmarshal(Bin{.op = op, .dst = Reg{1}, .v = Imm{2}, .is64 = false});
+                compare_marshal_unmarshal(Bin{.op = op, .dst = Reg{1}, .v = Imm{2}, .is64 = true});
             }
             SECTION("LDDW") {
                 compare_marshal_unmarshal(
-                    Bin{.op = Bin::Op::MOV, .is64 = true, .dst = Reg{1}, .v = Imm{2}, .lddw = true}, true);
+                    Bin{.op = Bin::Op::MOV, .dst = Reg{1}, .v = Imm{2}, .is64 = true, .lddw = true}, true);
             }
         }
     }
@@ -59,13 +62,13 @@ TEST_CASE("disasm_marshal", "[disasm][marshal]") {
         SECTION("Reg right") {
             for (auto op : ops) {
                 Condition cond{.op = op, .left = Reg{1}, .right = Reg{2}};
-                compare_marshal_unmarshal(Jmp{.cond = cond, .target = "1"});
+                compare_marshal_unmarshal(Jmp{.cond = cond, .target = label_t(1)});
             }
         }
         SECTION("Imm right") {
             for (auto op : ops) {
                 Condition cond{.op = op, .left = Reg{1}, .right = Imm{2}};
-                compare_marshal_unmarshal(Jmp{.cond = cond, .target = "1"});
+                compare_marshal_unmarshal(Jmp{.cond = cond, .target = label_t(1)});
             }
         }
     }

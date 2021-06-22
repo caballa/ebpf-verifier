@@ -1,5 +1,5 @@
 // Copyright (c) Prevail Verifier contributors.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 /*******************************************************************************
  *
  * Difference Bound Matrix domain based on the paper "Exploiting
@@ -27,7 +27,7 @@
 #include <utility>
 
 #include "crab/interval.hpp"
-#include "crab/linear_constraints.hpp"
+#include "crab/linear_constraint.hpp"
 #include "crab/thresholds.hpp"
 #include "crab/variable.hpp"
 #include "crab_utils/adapt_sgraph.hpp"
@@ -39,9 +39,6 @@
 
 //#define CHECK_POTENTIAL
 //#define SDBM_NO_NORMALIZE
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-compare"
 
 namespace crab {
 
@@ -79,7 +76,7 @@ struct SafeInt64DefaultParams {
  **/
 inline SafeInt64DefaultParams::Wt convert_NtoW(const z_number& n, bool& overflow) {
     overflow = false;
-    if (!n.fits_slong()) {
+    if (!n.fits_sint64()) {
         overflow = true;
         return 0;
     }
@@ -136,26 +133,26 @@ class SplitDBM final {
 
     // Evaluate an expression under the chosen potentials
     Wt eval_expression(const linear_expression_t& e, bool overflow) {
-        Wt res(convert_NtoW(e.constant(), overflow));
+        Wt res(convert_NtoW(e.constant_term(), overflow));
         if (overflow) {
             return Wt(0);
         }
 
-        for (auto [n, v] : e) {
-            Wt coef = convert_NtoW(v, overflow);
+        for (const auto& [variable, coefficient] : e.variable_terms()) {
+            Wt coef = convert_NtoW(coefficient, overflow);
             if (overflow) {
                 return Wt(0);
             }
-            res += (pot_value(n) - potential[0]) * coef;
+            res += (pot_value(variable) - potential[0]) * coef;
         }
         return res;
     }
 
     interval_t compute_residual(const linear_expression_t& e, variable_t pivot) {
-        interval_t residual(-e.constant());
-        for (auto [v, n] : e) {
-            if (v != pivot) {
-                residual = residual - (interval_t(n) * this->operator[](v));
+        interval_t residual(-e.constant_term());
+        for (const auto& [variable, coefficient] : e.variable_terms()) {
+            if (variable != pivot) {
+                residual = residual - (interval_t(coefficient) * this->operator[](variable));
             }
         }
         return residual;
@@ -208,10 +205,10 @@ class SplitDBM final {
 
     void add_disequation(const linear_expression_t& e) {
         // XXX: similar precision as the interval domain
-        for (auto [pivot, n] : e) {
-            interval_t i = compute_residual(e, pivot) / interval_t(n);
+        for (const auto& [variable, coefficient] : e.variable_terms()) {
+            interval_t i = compute_residual(e, variable) / interval_t(coefficient);
             if (auto k = i.singleton()) {
-                add_univar_disequation(pivot, *k);
+                add_univar_disequation(variable, *k);
             }
         }
     }
@@ -359,9 +356,9 @@ class SplitDBM final {
     void operator+=(const linear_constraint_t& cst);
 
     interval_t eval_interval(const linear_expression_t& e) {
-        interval_t r{e.constant()};
-        for (auto [v, n] : e)
-            r += n * operator[](v);
+        interval_t r{e.constant_term()};
+        for (const auto& [variable, coefficient] : e.variable_terms())
+            r += coefficient * operator[](variable);
         return r;
     }
 
@@ -430,11 +427,12 @@ class SplitDBM final {
         if (rhs.is_contradiction())
             return false;
 
-        if (rhs.is_equality()) {
+        if (rhs.kind() == constraint_kind_t::EQUALS_ZERO) {
             // try to convert the equality into inequalities so when it's
             // negated we do not have disequalities.
-            return entail_aux(linear_constraint_t(rhs.expression(), cst_kind::INEQUALITY)) &&
-                   entail_aux(linear_constraint_t(rhs.expression() * number_t(-1), cst_kind::INEQUALITY));
+            return entail_aux(linear_constraint_t(rhs.expression(), constraint_kind_t::LESS_THAN_OR_EQUALS_ZERO)) &&
+                   entail_aux(linear_constraint_t(rhs.expression() * number_t(-1),
+                                                  constraint_kind_t::LESS_THAN_OR_EQUALS_ZERO));
         } else {
             return entail_aux(rhs);
         }

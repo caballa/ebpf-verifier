@@ -9,10 +9,48 @@
 #include <vector>
 
 #include "crab/variable.hpp"
-#include "gpl/spec_type_descriptors.hpp"
 
 namespace crab {
-using label_t = std::string;
+struct label_t {
+    int from; ///< Jump source, or simply index of instruction
+    int to; ///< Jump target or -1
+
+    constexpr explicit label_t(int index, int to=-1) noexcept : from(index), to(to) { }
+
+    static constexpr label_t make_jump(const label_t& src_label, const label_t& target_label) {
+        return label_t{src_label.from, target_label.from};
+    }
+
+    constexpr bool operator==(const label_t& other) const { return from == other.from && to == other.to; }
+    constexpr bool operator!=(const label_t& other) const { return !(*this == other); }
+    constexpr bool operator<(const label_t& other) const {
+        if (this == &other) return false;
+        if (*this == label_t::exit) return false;
+        if (other == label_t::exit) return true;
+        return from < other.from || (from == other.from && to < other.to);
+    }
+
+    // no hash; intended for use in ordered containers.
+
+    [[nodiscard]] constexpr bool isjump() const { return to != -1; }
+
+    friend std::ostream& operator<<(std::ostream& os, const label_t& label) {
+        if (label == entry)
+            return os << "entry";
+        if (label == exit)
+            return os << "exit";
+        if (label.to == -1)
+            return os << label.from;
+        return os << label.from << ":" << label.to;
+    }
+
+    static const label_t entry;
+    static const label_t exit;
+};
+
+inline const label_t label_t::entry{-1};
+inline const label_t label_t::exit{-2};
+
 }
 using crab::label_t;
 
@@ -49,9 +87,9 @@ struct Bin {
     };
 
     Op op;
-    bool is64{};
     Reg dst;      ///< Destination.
     Value v;
+    bool is64{};
     bool lddw{};
 };
 
@@ -128,7 +166,6 @@ struct ArgPair {
 struct Call {
     int32_t func{};
     std::string name;
-    bool pkt_access{};
     bool returns_map{};
     std::vector<ArgSingle> singles;
     std::vector<ArgPair> pairs;
@@ -180,7 +217,7 @@ struct Assume {
 enum { T_UNINIT = -6, T_MAP = -5, T_NUM = -4, T_CTX = -3, T_STACK = -2, T_PACKET = -1, T_SHARED = 0 };
 
 enum class TypeGroup {
-    num,
+    number,
     map_fd,
     ctx,            ///< pointer to the special memory region named 'ctx'
     packet,         ///< pointer to the packet
@@ -189,7 +226,7 @@ enum class TypeGroup {
     non_map_fd,     // reg >= T_NUM
     mem,            // shared | packet | stack = reg >= T_STACK
     mem_or_num,     // reg >= T_NUM && reg != T_CTX
-    ptr,            // reg >= T_CTX
+    pointer,        // reg >= T_CTX
     ptr_or_num,     // reg >= T_NUM
     stack_or_packet // reg >= T_STACK && reg <= T_PACKET
 };
@@ -239,8 +276,13 @@ struct TypeConstraint {
     TypeGroup types;
 };
 
+/// Condition check whether something is a valid size.
+struct ZeroOffset {
+    Reg reg;
+};
+
 using AssertionConstraint =
-    std::variant<Comparable, Addable, ValidAccess, ValidStore, ValidSize, ValidMapKeyValue, TypeConstraint>;
+    std::variant<Comparable, Addable, ValidAccess, ValidStore, ValidSize, ValidMapKeyValue, TypeConstraint, ZeroOffset>;
 
 struct Assert {
     AssertionConstraint cst;
@@ -311,13 +353,13 @@ inline bool operator==(Assume const& a, Assume const& b) { return a.cond == b.co
 bool operator==(Assert const& a, Assert const& b);
 
 DECLARE_EQ2(TypeConstraint, reg, types)
-// DECLARE_EQ1(OnlyZeroIfNum, reg)
 DECLARE_EQ2(ValidSize, reg, can_be_zero)
 DECLARE_EQ2(Comparable, r1, r2)
 DECLARE_EQ2(Addable, ptr, num)
 DECLARE_EQ2(ValidStore, mem, val)
 DECLARE_EQ4(ValidAccess, reg, offset, width, or_null)
 DECLARE_EQ3(ValidMapKeyValue, access_reg, map_fd_reg, key)
+DECLARE_EQ1(ZeroOffset, reg)
 DECLARE_EQ1(Assert, cst)
 
 }

@@ -9,7 +9,7 @@
 #include <functional>
 #include <optional>
 #include <set>
-#include <unordered_map>
+#include <map>
 #include <utility>
 #include <vector>
 
@@ -23,12 +23,14 @@
 #include "crab/split_dbm.hpp"
 
 #include "asm_ostream.hpp"
-#include "config.hpp"
+#include "crab_verifier.hpp"
 #include "dsl_syntax.hpp"
-#include "gpl/spec_prototypes.hpp"
-#include "gpl/spec_type_descriptors.hpp"
+#include "helpers.hpp"
+#include "platform.hpp"
 
 #include "crab/array_domain.hpp"
+
+extern thread_local ebpf_verifier_options_t thread_local_options;
 
 namespace crab::domains {
 
@@ -47,12 +49,12 @@ inline reg_pack_t reg_pack(Reg r) { return reg_pack(r.v); }
 
 inline linear_constraint_t eq(variable_t a, variable_t b) {
     using namespace dsl_syntax;
-    return {a - b, cst_kind::EQUALITY};
+    return {a - b, constraint_kind_t::EQUALS_ZERO};
 }
 
 inline linear_constraint_t neq(variable_t a, variable_t b) {
     using namespace dsl_syntax;
-    return {a - b, cst_kind::DISEQUATION};
+    return {a - b, constraint_kind_t::NOT_ZERO};
 }
 
 constexpr int MAX_PACKET_OFF = 0xffff;
@@ -186,7 +188,9 @@ class ebpf_domain_t final {
 
     bool is_top() const { return m_inv.is_top() && stack.is_top(); }
 
-    bool operator<=(const ebpf_domain_t& other) { return m_inv <= other.m_inv && stack <= other.stack; }
+    bool operator<=(const ebpf_domain_t& other) {
+        return m_inv <= other.m_inv && stack <= other.stack;
+    }
 
     bool operator==(ebpf_domain_t other) {
         return stack == other.stack && m_inv <= other.m_inv && other.m_inv <= m_inv;
@@ -275,7 +279,7 @@ class ebpf_domain_t final {
     }
 
     void scratch_caller_saved_registers() {
-        for (int i = 1; i <= 5; i++) {
+        for (int i = R1_ARG; i <= R5_ARG; i++) {
             auto reg = reg_pack(i);
             havoc(reg.value);
             havoc(reg.offset);
@@ -339,14 +343,19 @@ class ebpf_domain_t final {
         assume(inv, cst);
     }
 
+    void require_false(NumAbsDomain& inv, std::string s) {
+        using namespace dsl_syntax;
+        require(m_inv, linear_expression_t(0) != 0, s);
+    }
+
     /// Forget everything we know about the value of a variable.
     void havoc(variable_t v) { m_inv -= v; }
 
     void assign(variable_t lhs, variable_t rhs) { m_inv.assign(lhs, rhs); }
 
-    /// Set a register to an integer with unknown value.
-    void no_pointer(reg_pack_t reg) {
-        assign(reg.type, T_NUM);
+    void assert_no_pointer(reg_pack_t reg) {
+        using namespace dsl_syntax;
+        require(m_inv, reg.type == T_NUM, "invalid operation on a non-numerical value");
         havoc(reg.offset);
     }
 
@@ -375,6 +384,21 @@ class ebpf_domain_t final {
     // It provides the basic operations of setting a variable or adding
     // a constraint, so all of them would be converted to some kind of
     // constraint that is added to the domain.
+
+    void operator()(const basic_block_t& bb, bool check_termination) {
+        for (const Instruction& statement : bb) {
+            std::visit(*this, statement);
+        }
+        if (check_termination) {
+            // +1 to avoid being tricked by empty loops
+            add(variable_t::instruction_count(), z_number((unsigned)bb.size() + 1));
+        }
+    }
+
+    int get_instruction_count_upper_bound() {
+        const auto& ub = m_inv[variable_t::instruction_count()].ub();
+        return (ub.is_finite() && ub.number().value().fits_sint()) ? (int)ub.number().value() : INT_MAX;
+    }
 
     void operator()(Assume const& s) {
         using namespace dsl_syntax;
@@ -438,11 +462,11 @@ class ebpf_domain_t final {
         case Un::Op::LE32:
         case Un::Op::LE64:
             havoc(dst.value);
-            no_pointer(dst);
+            assert_no_pointer(dst);
             break;
         case Un::Op::NEG:
             neg(dst.value);
-            no_pointer(dst);
+            assert_no_pointer(dst);
             break;
         }
     }
@@ -471,11 +495,28 @@ class ebpf_domain_t final {
     void operator()(const ValidMapKeyValue& s) {
         using namespace dsl_syntax;
 
+        // Get the actual map_fd value to look up the key size and value size.
         auto fd_reg = reg_pack(s.map_fd_reg);
-        apply(m_inv, crab::bitwise_binop_t::LSHR, variable_t::map_value_size(), fd_reg.value, (number_t)14);
-        variable_t mk = variable_t::map_key_size();
-        apply(m_inv, crab::arith_binop_t::UREM, mk, fd_reg.value, (number_t)(1 << 14));
-        lshr(mk, 6);
+        interval_t fd_interval = operator[](fd_reg.value);
+        std::optional<EbpfMapType> map_type;
+        uint32_t max_entries = 0;
+        if (fd_interval.is_bottom()) {
+            m_inv.set(variable_t::map_value_size(), interval_t::bottom());
+            m_inv.set(variable_t::map_key_size(), interval_t::bottom());
+        } else {
+            std::optional<number_t> fd_opt = fd_interval.singleton();
+            if (fd_opt.has_value()) {
+                number_t map_fd = *fd_opt;
+                EbpfMapDescriptor& map_descriptor = global_program_info.platform->get_map_descriptor((int)map_fd);
+                m_inv.assign(variable_t::map_value_size(), (int)map_descriptor.value_size);
+                m_inv.assign(variable_t::map_key_size(), (int)map_descriptor.key_size);
+                map_type = global_program_info.platform->get_map_type(map_descriptor.type);
+                max_entries = map_descriptor.max_entries;
+            } else {
+                m_inv.set(variable_t::map_value_size(), interval_t::top());
+                m_inv.set(variable_t::map_key_size(), interval_t::top());
+            }
+        }
 
         auto access_reg = reg_pack(s.access_reg);
 
@@ -485,6 +526,28 @@ class ebpf_domain_t final {
         std::string m = std::string(" (") + to_string(s) + ")";
         require(m_inv, access_reg.type >= T_STACK, "Only stack or packet can be used as a parameter" + m);
         require(m_inv, access_reg.type <= T_PACKET, "Only stack or packet can be used as a parameter" + m);
+
+        auto when_stack = when(m_inv, access_reg.type == T_STACK);
+        if (!when_stack.is_bottom()) {
+            if (!stack.all_num(when_stack, lb, ub)) {
+                require(when_stack, access_reg.type != T_STACK, "Illegal map update with a non-numerical value.");
+            } else if (thread_local_options.strict && map_type.has_value() && map_type->is_array) {
+                // Get offset value.
+                variable_t key_ptr = access_reg.offset;
+                std::optional<number_t> offset = m_inv[key_ptr].singleton();
+                if (!offset.has_value()) {
+                    require_false(m_inv, "Pointer must be a singleton");
+                } else if (s.key) {
+                    // Look up the value pointed to by the key pointer.
+                    variable_t key_value =
+                        variable_t::cell_var(data_kind_t::values, (uint64_t)offset.value(), sizeof(uint32_t));
+
+                    require(m_inv, key_value < max_entries, "Array index overflow");
+                    require(m_inv, key_value >= 0, "Array index underflow");
+                }
+            }
+        }
+
         m_inv = check_access_packet(when(m_inv, access_reg.type == T_PACKET), lb, ub, m, false) |
                 check_access_stack(when(m_inv, access_reg.type == T_STACK), lb, ub, m);
     }
@@ -519,6 +582,7 @@ class ebpf_domain_t final {
                 return;
             } else {
                 require(m_inv, reg.type > T_NUM, "Only pointers can be dereferenced");
+                require(m_inv, reg.value > 0, "Possible null access");
                 m_inv = std::move(assume_ptr);
                 return;
             }
@@ -528,36 +592,36 @@ class ebpf_domain_t final {
     NumAbsDomain check_access_packet(NumAbsDomain inv, const linear_expression_t& lb, const linear_expression_t& ub, const std::string& s,
                                      bool is_comparison_check) {
         using namespace dsl_syntax;
-        require(inv, lb >= variable_t::meta_offset(), std::string("Lower bound must be higher than meta_offset") + s);
+        require(inv, lb >= variable_t::meta_offset(), std::string("Lower bound must be at least meta_offset") + s);
         if (is_comparison_check)
             require(inv, ub <= MAX_PACKET_OFF,
-                    std::string("Upper bound must be lower than ") + std::to_string(MAX_PACKET_OFF) + s);
+                    std::string("Upper bound must be at most ") + std::to_string(MAX_PACKET_OFF) + s);
         else
             require(inv, ub <= variable_t::packet_size(),
-                    std::string("Upper bound must be lower than meta_offset") + s);
+                    std::string("Upper bound must be at most packet_size") + s);
         return inv;
     }
 
     NumAbsDomain check_access_stack(NumAbsDomain inv, const linear_expression_t& lb, const linear_expression_t& ub, const std::string& s) {
         using namespace dsl_syntax;
-        require(inv, lb >= 0, std::string("Lower bound must be higher than 0") + s);
-        require(inv, ub <= STACK_SIZE, std::string("Upper bound must be lower than STACK_SIZE") + s);
+        require(inv, lb >= 0, std::string("Lower bound must be at least 0") + s);
+        require(inv, ub <= EBPF_STACK_SIZE, std::string("Upper bound must be at most EBPF_STACK_SIZE") + s + std::string(", make sure to bounds check any pointer access"));
         return inv;
     }
 
     NumAbsDomain check_access_shared(NumAbsDomain inv, const linear_expression_t& lb, const linear_expression_t& ub, const std::string& s,
                                      variable_t reg_type) {
         using namespace dsl_syntax;
-        require(inv, lb >= 0, std::string("Lower bound must be higher than 0") + s);
-        require(inv, ub <= reg_type, std::string("Upper bound must be lower than ") + reg_type.name() + s);
+        require(inv, lb >= 0, std::string("Lower bound must be at least 0") + s);
+        require(inv, ub <= reg_type, std::string("Upper bound must be at most ") + reg_type.name() + s);
         return inv;
     }
 
     NumAbsDomain check_access_context(NumAbsDomain inv, const linear_expression_t& lb, const linear_expression_t& ub, const std::string& s) {
         using namespace dsl_syntax;
-        require(inv, lb >= 0, std::string("Lower bound must be higher than 0") + s);
-        require(inv, ub <= global_program_info.descriptor.size,
-                std::string("Upper bound must be lower than ") + std::to_string(global_program_info.descriptor.size) +
+        require(inv, lb >= 0, std::string("Lower bound must be at least 0") + s);
+        require(inv, ub <= global_program_info.type.context_descriptor->size,
+                std::string("Upper bound must be at most ") + std::to_string(global_program_info.type.context_descriptor->size) +
                     s);
         return inv;
     }
@@ -579,7 +643,7 @@ class ebpf_domain_t final {
         variable_t t = reg_pack(s.reg).type;
         std::string str = to_string(s);
         switch (s.types) {
-        case TypeGroup::num: require(m_inv, t == T_NUM, str); break;
+        case TypeGroup::number: require(m_inv, t == T_NUM, str); break;
         case TypeGroup::map_fd: require(m_inv, t == T_MAP, str); break;
         case TypeGroup::ctx: require(m_inv, t == T_CTX, str); break;
         case TypeGroup::packet: require(m_inv, t == T_PACKET, str); break;
@@ -591,7 +655,7 @@ class ebpf_domain_t final {
             require(m_inv, t >= T_NUM, str);
             require(m_inv, t != T_CTX, str);
             break;
-        case TypeGroup::ptr: require(m_inv, t >= T_CTX, str); break;
+        case TypeGroup::pointer: require(m_inv, t >= T_CTX, str); break;
         case TypeGroup::ptr_or_num: require(m_inv, t >= T_NUM, str); break;
         case TypeGroup::stack_or_packet:
             require(m_inv, t >= T_STACK, str);
@@ -600,10 +664,16 @@ class ebpf_domain_t final {
         }
     }
 
+    void operator()(const ZeroOffset& s) {
+        using namespace dsl_syntax;
+        auto reg = reg_pack(s.reg);
+        require(m_inv, reg.offset == 0, to_string(s));
+    }
+
     void operator()(Assert const& stmt) { std::visit(*this, stmt.cst); };
 
     void operator()(Packet const& a) {
-        auto reg = reg_pack(0);
+        auto reg = reg_pack(R0_RETURN_VALUE);
         assign(reg.type, T_NUM);
         havoc(reg.offset);
         havoc(reg.value);
@@ -616,7 +686,15 @@ class ebpf_domain_t final {
 
         inv.assign(target.type, T_NUM);
         inv -= target.offset;
-        inv -= target.value;
+
+        // A 1 or 2 byte copy results in a limited range of values that may be used as array indices.
+        if (width == 1) {
+            inv.set(target.value, interval_t(0, UINT8_MAX));
+        } else if (width == 2) {
+            inv.set(target.value, interval_t(0, UINT16_MAX));
+        } else {
+            inv -= target.value;
+        }
         return inv;
     }
 
@@ -625,11 +703,11 @@ class ebpf_domain_t final {
         if (inv.is_bottom())
             return inv;
 
-        ptype_descr desc = global_program_info.descriptor;
+        const ebpf_context_descriptor_t* desc = global_program_info.type.context_descriptor;
 
         inv -= target.value;
 
-        if (desc.end < 0) {
+        if (desc->end < 0) {
             inv -= target.offset;
             inv.assign(target.type, T_NUM);
             return inv;
@@ -638,7 +716,7 @@ class ebpf_domain_t final {
         interval_t interval = inv.eval_interval(addr_vague);
         std::optional<number_t> maybe_addr = interval.singleton();
 
-        bool may_touch_ptr = interval[desc.data] || interval[desc.end] || interval[desc.end];
+        bool may_touch_ptr = interval[desc->data] || interval[desc->end] || interval[desc->end];
 
         if (!maybe_addr) {
             inv -= target.offset;
@@ -651,11 +729,11 @@ class ebpf_domain_t final {
 
         number_t addr = *maybe_addr;
 
-        if (addr == desc.data) {
+        if (addr == desc->data) {
             inv.assign(target.offset, 0);
-        } else if (addr == desc.end) {
+        } else if (addr == desc->end) {
             inv.assign(target.offset, variable_t::packet_size());
-        } else if (addr == desc.meta) {
+        } else if (addr == desc->meta) {
             inv.assign(target.offset, variable_t::meta_offset());
         } else {
             inv -= target.offset;
@@ -672,7 +750,7 @@ class ebpf_domain_t final {
     }
 
     NumAbsDomain do_load_stack(NumAbsDomain inv, reg_pack_t target, const linear_expression_t& addr, int width) {
-        if (width == 8) {
+        if (width == 1 || width == 2 || width == 4 || width == 8) {
             inv.assign(target.type, stack.load(inv, data_kind_t::types, addr, width));
             inv.assign(target.value, stack.load(inv,  data_kind_t::values, addr, width));
             inv.assign(target.offset, stack.load(inv, data_kind_t::offsets, addr, width));
@@ -693,7 +771,7 @@ class ebpf_domain_t final {
         int offset = b.access.offset;
         linear_expression_t addr = mem_reg.offset + (number_t)offset;
 
-        if (b.access.basereg.v == 10) {
+        if (b.access.basereg.v == R10_STACK_POINTER) {
             m_inv = do_load_stack(std::move(m_inv), target, addr, width);
             return;
         }
@@ -737,6 +815,10 @@ class ebpf_domain_t final {
                 inv.assign(stack.store(inv, data_kind_t::offsets, addr, width, *opt_val_offset), *opt_val_offset);
             else
                 stack.havoc(inv, data_kind_t::offsets, addr, width);
+        } else if ((width == 1 || width == 2 || width == 4) && get_type(val_type) == T_NUM) {
+            // Keep track of numbers on the stack that might be used as array indices.
+            inv.assign(stack.store(inv, data_kind_t::values, addr, width, val_value), val_value);
+            stack.havoc(inv, data_kind_t::offsets, addr, width);
         } else {
             stack.havoc(inv, data_kind_t::values, addr, width);
             stack.havoc(inv, data_kind_t::offsets, addr, width);
@@ -764,18 +846,25 @@ class ebpf_domain_t final {
         auto mem_reg = reg_pack(b.access.basereg);
         int width = b.access.width;
         int offset = b.access.offset;
-        if (b.access.basereg.v == 10) {
-            int addr = STACK_SIZE + offset;
+        if (b.access.basereg.v == R10_STACK_POINTER) {
+            int addr = EBPF_STACK_SIZE + offset;
             do_store_stack(m_inv, width, addr, val_type, val_value, opt_val_offset);
             return;
         }
-        linear_expression_t addr = mem_reg.offset + (number_t)offset;
+        linear_expression_t addr = linear_expression_t(mem_reg.offset) + offset;
         switch (get_type(mem_reg.type)) {
             case T_STACK: do_store_stack(m_inv, width, addr, val_type, val_value, opt_val_offset); return;
             case T_UNINIT: { //maybe stack
                 NumAbsDomain assume_not_stack(m_inv);
+#ifdef _MSC_VER
+                // MSVC seems to have a harder time coercing the right things, so force
+                // the correct interpretations.
+                assume_not_stack += (linear_constraint_t)(mem_reg.type != T_STACK);
+                m_inv += crab::dsl_syntax::operator==(mem_reg.type, T_STACK);
+#else
                 assume_not_stack += mem_reg.type != T_STACK;
                 m_inv += mem_reg.type == T_STACK;
+#endif
                 if (!m_inv.is_bottom()) {
                     do_store_stack(m_inv, width, addr, val_type, val_value, opt_val_offset);
                 }
@@ -831,7 +920,7 @@ class ebpf_domain_t final {
             }
         }
         scratch_caller_saved_registers();
-        auto r0 = reg_pack(0);
+        auto r0 = reg_pack(R0_RETURN_VALUE);
         havoc(r0.value);
         if (call.returns_map) {
             // no support for map-in-map yet:
@@ -867,7 +956,8 @@ class ebpf_domain_t final {
             switch (bin.op) {
             case Bin::Op::MOV:
                 assign(dst.value, imm);
-                no_pointer(dst);
+                assign(dst.type, T_NUM);
+                havoc(dst.offset);
                 break;
             case Bin::Op::ADD:
                 if (imm == 0)
@@ -883,19 +973,19 @@ class ebpf_domain_t final {
                 break;
             case Bin::Op::MUL:
                 mul(dst.value, imm);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::DIV:
                 div(dst.value, imm);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::MOD:
                 rem(dst.value, imm);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::OR:
                 bitwise_or(dst.value, imm);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::AND:
                 // FIX: what to do with ptr&-8 as in counter/simple_loop_unrolled?
@@ -904,26 +994,29 @@ class ebpf_domain_t final {
                     assume(dst.value <= imm);
                     assume(0 <= dst.value);
                 }
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::LSH:
-                shl_overflow(dst.value, imm); // avoid signedness and overflow issues in shl_overflow(dst.value, imm);
-                no_pointer(dst);
+                // avoid signedness and overflow issues in shl_overflow(dst.value, imm);
+                shl_overflow(dst.value, imm);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::RSH:
-                havoc(dst.value); // avoid signedness and overflow issues in lshr(dst.value, imm);
-                no_pointer(dst);
+                // avoid signedness and overflow issues in lshr(dst.value, imm);
+                havoc(dst.value);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::ARSH:
-                havoc(dst.value); // avoid signedness and overflow issues in ashr(dst.value, imm); // = (int64_t)dst >>
-                                  // imm;
+                // avoid signedness and overflow issues in ashr(dst.value, imm);
+                // = (int64_t)dst >> imm;
+                havoc(dst.value);
                 // assume(dst.value <= (1 << (64 - imm)));
                 // assume(dst.value >= -(1 << (64 - imm)));
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::XOR:
                 bitwise_xor(dst.value, imm);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             }
         } else {
@@ -970,41 +1063,41 @@ class ebpf_domain_t final {
             }
             case Bin::Op::MUL:
                 mul(dst.value, src.value);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::DIV:
                 // DIV is not checked for zerodiv
                 div(dst.value, src.value);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::MOD:
                 // See DIV comment
                 rem(dst.value, src.value);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::OR:
                 bitwise_or(dst.value, src.value);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::AND:
                 bitwise_and(dst.value, src.value);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::LSH:
                 shl_overflow(dst.value, src.value);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::RSH:
                 havoc(dst.value);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::ARSH:
                 havoc(dst.value);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::XOR:
                 bitwise_xor(dst.value, src.value);
-                no_pointer(dst);
+                assert_no_pointer(dst);
                 break;
             case Bin::Op::MOV:
                 assign(dst.value, src.value);
@@ -1022,22 +1115,22 @@ class ebpf_domain_t final {
         if (dom.is_bottom()) {
             o << "_|_";
         } else {
-            o << dom.m_inv << "\n" << dom.stack;
+            o << dom.m_inv << "\nStack: " << dom.stack;
         }
         return o;
     }
 
-    static ebpf_domain_t setup_entry() {
+    static ebpf_domain_t setup_entry(bool check_termination) {
         using namespace dsl_syntax;
 
-        // intra_abs_transformer<AbsDomain>(inv);
         ebpf_domain_t inv;
-        auto r10 = reg_pack(10);
-        inv += STACK_SIZE <= r10.value;
-        inv.assign(r10.offset, STACK_SIZE);
+        auto r10 = reg_pack(R10_STACK_POINTER);
+        inv += EBPF_STACK_SIZE <= r10.value;
+        inv += r10.value <= PTR_MAX;
+        inv.assign(r10.offset, EBPF_STACK_SIZE);
         inv.assign(r10.type, T_STACK);
 
-        auto r1 = reg_pack(1);
+        auto r1 = reg_pack(R1_ARG);
         inv += 1 <= r1.value;
         inv += r1.value <= PTR_MAX;
         inv.assign(r1.offset, 0);
@@ -1045,11 +1138,14 @@ class ebpf_domain_t final {
 
         inv += 0 <= variable_t::packet_size();
         inv += variable_t::packet_size() < MAX_PACKET_OFF;
-        if (global_program_info.descriptor.meta >= 0) {
+        if (global_program_info.type.context_descriptor->meta >= 0) {
             inv += variable_t::meta_offset() <= 0;
             inv += variable_t::meta_offset() >= -4098;
         } else {
             inv.assign(variable_t::meta_offset(), 0);
+        }
+        if (check_termination) {
+            inv.assign(variable_t::instruction_count(), 0);
         }
         return inv;
     }

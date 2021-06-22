@@ -4,8 +4,11 @@
 counter/samples/*
 **/#*
 check
+tests
 ./unit-test
 .vscode/*
 logs/*
 build
 html
+Debug/*
+Release/*

@@ -1,5 +1,5 @@
 // Copyright (c) Prevail Verifier contributors.
-// // SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: MIT
 #include <iostream>
 #include <vector>
 
@@ -7,15 +7,14 @@
 
 #include "CLI11.hpp"
 
-#include "asm_syntax.hpp"
-#include "crab/cfg.hpp"
-#include "asm_files.hpp"
-#include "asm_ostream.hpp"
-#include "asm_unmarshal.hpp"
-#include "config.hpp"
-#include "crab_verifier.hpp"
-#include "memsize.hpp"
+#include "ebpf_verifier.hpp"
+#ifdef _WIN32
+#include "memsize_windows.hpp"
+#else
+#include "memsize_linux.hpp"
+#endif
 #include "linux_verifier.hpp"
+#include "utils.hpp"
 
 using std::string;
 using std::vector;
@@ -27,6 +26,8 @@ static size_t hash(const raw_program& raw_prog) {
 }
 
 int main(int argc, char** argv) {
+    ebpf_verifier_options_t ebpf_verifier_options = ebpf_verifier_default_options;
+
     // Parse command line arguments:
 
     crab::CrabEnableWarningMsg(false);
@@ -43,16 +44,18 @@ int main(int argc, char** argv) {
     app.add_flag("-l", list, "List sections");
 
     std::string domain = "zoneCrab";
-    std::set<string> doms{"stats", "linux", "zoneCrab"};
+    std::set<string> doms{"stats", "linux", "zoneCrab", "cfg"};
     app.add_set("-d,--dom,--domain", domain, doms, "Abstract domain")->type_name("DOMAIN");
 
-    bool verbose = false;
-    app.add_flag("-i", global_options.print_invariants, "Print invariants");
-    app.add_flag("-f", global_options.print_failures, "Print verifier's failure logs");
-    app.add_flag("-v", verbose, "Print both invariants and failures");
+    ebpf_verifier_options.check_termination = false;
+    app.add_flag("--termination", ebpf_verifier_options.check_termination, "Verify termination");
 
-    bool no_simplify{false};
-    app.add_flag("--no-simplify", no_simplify, "Do not simplify");
+    bool verbose = false;
+    app.add_flag("-i", ebpf_verifier_options.print_invariants, "Print invariants");
+    app.add_flag("-f", ebpf_verifier_options.print_failures, "Print verifier's failure logs");
+    app.add_flag("-s", ebpf_verifier_options.strict, "Apply additional checks that would cause runtime failures");
+    app.add_flag("-v", verbose, "Print both invariants and failures");
+    app.add_flag("--no-simplify", ebpf_verifier_options.no_simplify, "Do not simplify");
 
     std::string asmfile;
     app.add_option("--asm", asmfile, "Print disassembly to FILE")->type_name("FILE");
@@ -63,9 +66,8 @@ int main(int argc, char** argv) {
 
     CLI11_PARSE(app, argc, argv);
     if (verbose)
-        global_options.print_invariants = global_options.print_failures = true;
+        ebpf_verifier_options.print_invariants = ebpf_verifier_options.print_failures = true;
 
-    global_options.simplify = !no_simplify;
     // Main program
 
     if (filename == "@headers") {
@@ -86,15 +88,23 @@ int main(int argc, char** argv) {
 
 #if !__linux__
     if (domain == "linux") {
-        std::cerr << "linux domain is unsupported on this machine\n";
+        std::cerr << "error: linux domain is unsupported on this machine\n";
         return 64;
     }
 #endif
 
-    auto create_map = domain == "linux" ? create_map_linux : create_map_crab;
+    if (domain == "linux")
+        ebpf_verifier_options.mock_map_fds = false;
+    const ebpf_platform_t* platform = &g_ebpf_platform_linux;
 
     // Read a set of raw program sections from an ELF file.
-    auto raw_progs = read_elf(filename, desired_section, create_map);
+    vector<raw_program> raw_progs;
+    try {
+        raw_progs = read_elf(filename, desired_section, &ebpf_verifier_options, platform);
+    } catch (std::runtime_error& e) {
+        std::cerr << "error: " << e.what() << std::endl;
+        return 1;
+    }
 
     if (list || raw_progs.size() != 1) {
         if (!list) {
@@ -104,7 +114,7 @@ int main(int argc, char** argv) {
         if (!desired_section.empty() && raw_progs.size() == 0) {
             // We could not find the desired section, so get the full list
             // of possibilities.
-            raw_progs = read_elf(filename, string(), create_map);
+            raw_progs = read_elf(filename, string(), &ebpf_verifier_options, platform);
         }
         for (const raw_program& raw_prog : raw_progs) {
             std::cout << raw_prog.section << " ";
@@ -119,7 +129,7 @@ int main(int argc, char** argv) {
     // Convert the raw program section to a set of instructions.
     std::variant<InstructionSeq, std::string> prog_or_error = unmarshal(raw_prog);
     if (std::holds_alternative<string>(prog_or_error)) {
-        std::cout << "trivial verification failure: " << std::get<string>(prog_or_error) << "\n";
+        std::cout << "unmarshaling error at " << std::get<string>(prog_or_error) << "\n";
         return 1;
     }
 
@@ -129,22 +139,23 @@ int main(int argc, char** argv) {
     }
 
     if (domain == "zoneCrab") {
-        // Convert the instruction sequence to a control-flow graph
-        // in a "passive", non-deterministic form.
-        cfg_t cfg = prepare_cfg(prog, raw_prog.info, global_options.simplify);
-
-        // Analyze the control-flow graph.
-        const auto [res, seconds] = run_ebpf_analysis(cfg, raw_prog.info);
+        ebpf_verifier_stats_t verifier_stats;
+        const auto [res, seconds] = timed_execution([&] {
+            return ebpf_verify_program(std::cout, prog, raw_prog.info, &ebpf_verifier_options, &verifier_stats);
+        });
+        if (ebpf_verifier_options.check_termination && (ebpf_verifier_options.print_failures || ebpf_verifier_options.print_invariants)) {
+            std::cout << "Program terminates within " << verifier_stats.max_instruction_count << " instructions\n";
+        }
         std::cout << res << "," << seconds << "," << resident_set_size_kb() << "\n";
         return !res;
     } else if (domain == "linux") {
         // Pass the intruction sequence to the Linux kernel verifier.
-        const auto [res, seconds] = bpf_verify_program(raw_prog.info.program_type, raw_prog.prog);
+        const auto [res, seconds] = bpf_verify_program(raw_prog.info.type, raw_prog.prog, &ebpf_verifier_options);
         std::cout << res << "," << seconds << "," << resident_set_size_kb() << "\n";
         return !res;
     } else if (domain == "stats") {
         // Convert the instruction sequence to a control-flow graph.
-        cfg_t cfg = prepare_cfg(prog, raw_prog.info, global_options.simplify);
+        cfg_t cfg = prepare_cfg(prog, raw_prog.info, !ebpf_verifier_options.no_simplify);
 
         // Just print eBPF program stats.
         auto stats = collect_stats(cfg);
@@ -155,6 +166,11 @@ int main(int argc, char** argv) {
         for (const string& h : stats_headers()) {
             std::cout << "," << stats.at(h);
         }
+        std::cout << "\n";
+    } else if (domain == "cfg") {
+        // Convert the instruction sequence to a control-flow graph.
+        cfg_t cfg = prepare_cfg(prog, raw_prog.info, !ebpf_verifier_options.no_simplify);
+        std::cout << cfg;
         std::cout << "\n";
     } else {
         assert(false);

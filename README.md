@@ -9,18 +9,34 @@ The version discussed in the [PLDI paper](https://vbpf.github.io/assets/prevail-
 
 ### Dependencies from vanilla Ubuntu
 ```bash
-sudo apt install build-essential git cmake libboost-dev libgmp-dev
+sudo apt install build-essential git cmake libboost-dev
 sudo apt install python3-pip python3-tk
 pip3 install matplotlib   # for plotting the graphs
 ```
 
+### Dependencies from vanilla Windows
+
+* Install [git](https://git-scm.com/download/win)
+* Install [Visual Studio Build Tools 2019](https://aka.ms/vs/16/release/vs_buildtools.exe) and choose the "C++ build tools" workload (Visual Studio Build Tools 2019 has support for CMake Version 3.15).
+* Install [nuget.exe](https://www.nuget.org/downloads)
+
 ### Installation
-Clone and make:
+Clone:
 ```
 git clone --recurse-submodules https://github.com/vbpf/ebpf-verifier.git
 cd ebpf-verifier
+```
+
+Make on Ubuntu:
+```
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+```
+
+Make on Windows (which uses a multi-configuration generator):
+```
+cmake -B build
+cmake --build build --config Release
 ```
 
 ### Running with Docker
@@ -47,7 +63,6 @@ The output is three comma-separated values:
 
 Usage:
 ```
-ebpf-verifier$ ./check -h
 A new eBPF verifier
 Usage: ./check [OPTIONS] path [section]
 
@@ -58,14 +73,15 @@ Positionals:
 Options:
   -h,--help                   Print this help message and exit
   -l                          List sections
-  -d,--dom,--domain DOMAIN:{linux,stats,zoneCrab}
+  -d,--dom,--domain DOMAIN:{cfg,linux,stats,zoneCrab}
                               Abstract domain
+  --termination               Verify termination
   -i                          Print invariants
   -f                          Print verifier's failure logs
   -v                          Print both invariants and failures
   --no-simplify               Do not simplify
   --asm FILE                  Print disassembly to FILE
-  --dot FILE                  Export cfg to dot FILE
+  --dot FILE                  Export control-flow graph to dot FILE
 
 You can use @headers as the path to instead just show the output field headers.
 ```
@@ -136,9 +152,10 @@ make -C counter
 scripts/runperf.sh counter/objects stats zoneCrab
 ```
 
-Two examples of real-world false positive are taken from the Linux samples suite.
-The file `xdp_tx_iptunnel_kern.o` is valid and passes both the Linux tool and ours.
-However, in the original source code there are redundant loads from memory to a varaible holding the same value. These were added happen due to untracked register spilling that led to false positive. Two fixes are compiled into `xdp_tx_iptunnel_1_kern.o` and `xdp_tx_iptunnel_2_kern.o`. Both pass our verifier (without any special effort) but fail the existing one:
+Valid programs that are rejected by a verifier are referred to as false positives.
+Two examples of real-world false positives are taken from the Linux samples suite.
+The file `xdp_tx_iptunnel_kern.o` is valid and passes both the Linux kernel verifier and ours.
+However, in the original source code there are redundant loads from memory to a variable holding the same value. These were added due to untracked register spilling that led to a false positive. Two fixes are compiled into `xdp_tx_iptunnel_1_kern.o` and `xdp_tx_iptunnel_2_kern.o`. Both pass our verifier (without any special effort) but fail the Linux kernel verifier:
 ```
 $ ./check counter/objects/xdp_tx_iptunnel_2_kern.o
 1,0.314213,86740
@@ -163,9 +180,8 @@ counter/objects/simple_loop_ptr_backwards.o
 back-edge from insn 7 to 5
 ```
 
-Using our tool, the safety (but not termination) of some loop-based programs can be verified:
+Using our tool, the safety and termination of some loop-based programs can be verified:
 ```
-$ ./check counter/objects/simple_loop_ptr_backwards.o
-1,0.018346,7900
+$ ./check --termination counter/objects/simple_loop_ptr_backwards.o
 ```
 (not all the programs in the folder are verified)

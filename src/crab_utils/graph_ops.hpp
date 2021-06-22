@@ -1,5 +1,5 @@
 // Copyright (c) Prevail Verifier contributors.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include <algorithm>
@@ -10,8 +10,10 @@
 //============================
 // A set of utility algorithms for manipulating graphs.
 
+#ifdef __GNUC__
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wsign-compare"
+#endif
 
 namespace crab {
 // Graph views - for when we want to traverse some mutation
@@ -94,11 +96,11 @@ class GraphPerm {
     }
 
     // Number of allocated vertices
-    int size() const { return perm.size(); }
+    size_t size() const { return perm.size(); }
 
     using vert_range = num_range<vert_id>;
     using vert_iterator = typename num_range<vert_id>::value_ref;
-    vert_range verts() const { return vert_range(perm.size()); }
+    vert_range verts() const { return vert_range(static_cast<vert_id>(perm.size())); }
 
     // GKG: Should probably modify this to handle cases where
     // the vertex iterator isn't just a vert_id*.
@@ -257,7 +259,7 @@ class SubGraph {
     void clear() { assert(0 && "SubGraph::clear not implemented."); }
 
     // Number of allocated vertices
-    int size() const { return g.size(); }
+    size_t size() const { return g.size(); }
 
     // Assumption: (x, y) not in mtx
     void add_edge(vert_id x, Wt wt, vert_id y) {
@@ -467,12 +469,12 @@ class GraphOps {
     // Should really switch to some kind of arena allocator, rather
     // than having all these static structures.
     // ===========================================
-    static char* edge_marks;
+    static thread_local char* edge_marks;
 
     // Used for Bellman-Ford queueing
-    static vert_id* dual_queue;
-    static int* vert_marks;
-    static unsigned int scratch_sz;
+    static thread_local vert_id* dual_queue;
+    static thread_local int* vert_marks;
+    static thread_local size_t scratch_sz;
 
     // For locality, should combine dists & dist_ts.
     // Wt must have an empty constructor, but does _not_
@@ -480,24 +482,33 @@ class GraphOps {
     // dist_ts tells us which distances are current,
     // and ts_idx prevents wraparound problems, in the unlikely
     // circumstance that we have more than 2^sizeof(uint) iterations.
-    static std::vector<Wt> dists;
-    static std::vector<Wt> dists_alt;
-    static std::vector<unsigned int> dist_ts;
-    static unsigned int ts;
-    static unsigned int ts_idx;
+    static thread_local std::vector<Wt> dists;
+    static thread_local std::vector<Wt> dists_alt;
+    static thread_local std::vector<unsigned int> dist_ts;
+    static thread_local unsigned int ts;
+    static thread_local unsigned int ts_idx;
 
-    static void grow_scratch(unsigned int sz) {
+    static void check_realloc(void** ptr, size_t size) {
+        void* newptr = realloc(*ptr, size);
+        if (newptr == nullptr)
+            throw std::bad_alloc();
+        *ptr = newptr;
+    }
+
+    static void grow_scratch(size_t sz) {
         if (sz <= scratch_sz)
             return;
 
-        if (scratch_sz == 0)
-            scratch_sz = 10; // Introduce enums for init_sz and growth_factor
-        while (scratch_sz < sz)
-            scratch_sz *= 1.5;
+        size_t new_sz = scratch_sz;
+        if (new_sz == 0)
+            new_sz = 10; // TODO: Introduce enums for init_sz and growth_factor
+        while (new_sz < sz)
+            new_sz = static_cast<size_t>(new_sz * 1.5);
 
-        edge_marks = (char*)realloc(edge_marks, sizeof(char) * scratch_sz * scratch_sz);
-        dual_queue = (vert_id*)realloc(dual_queue, sizeof(vert_id) * 2 * scratch_sz);
-        vert_marks = (int*)realloc(vert_marks, sizeof(int) * scratch_sz);
+        check_realloc((void**)&edge_marks, sizeof(char) * new_sz * new_sz);
+        check_realloc((void**)&dual_queue, sizeof(vert_id) * 2 * new_sz);
+        check_realloc((void**)&vert_marks, sizeof(int) * new_sz);
+        scratch_sz = new_sz;
 
         // Initialize new elements as necessary.
         while (dists.size() < scratch_sz) {
@@ -512,7 +523,7 @@ class GraphOps {
     static graph_t join(G1& l, G2& r) {
         // For the join, potentials are preserved
         assert(l.size() == r.size());
-        int sz = l.size();
+        size_t sz = l.size();
 
         graph_t g;
         g.growTo(sz);
@@ -628,7 +639,7 @@ class GraphOps {
 
     template <class G>
     static void compute_sccs(G& x, std::vector<std::vector<vert_id>>& out_scc) {
-        int sz = x.size();
+        size_t sz = x.size();
         grow_scratch(sz);
 
         for (vert_id v : x.verts())
@@ -659,7 +670,7 @@ class GraphOps {
     // Returns false if there is some negative cycle.
     template <class G, class P>
     static bool select_potentials(G& g, P& potentials) {
-        int sz = g.size();
+        size_t sz = g.size();
         assert(potentials.size() >= sz);
         grow_scratch(sz);
 
@@ -672,8 +683,6 @@ class GraphOps {
       // Zero existing potentials.
       // Not strictly necessary, but means we're less
       // likely to run into over/underflow.
-      // (gmp_z won't overflow, but there's a performance penalty
-      // if magnitudes become large)
       //
       // Though this hurts our chances of early cutoff.
       for(vert_id v : g.verts())
@@ -698,7 +707,7 @@ class GraphOps {
                 qtail++;
             }
 
-            for (int iter = 0; iter < scc.size(); iter++) {
+            for (size_t iter = 0; iter < scc.size(); iter++) {
                 for (; qtail != qhead;) {
                     vert_id s = *(--qtail);
                     // If it _was_ on the queue, it must be in the SCC
@@ -750,7 +759,7 @@ class GraphOps {
         // and potentials have been initialized.
         // We just want to restore closure.
         assert(l.size() == r.size());
-        unsigned int sz = l.size();
+        size_t sz = l.size();
         grow_scratch(sz);
         delta.clear();
 
@@ -805,7 +814,7 @@ class GraphOps {
     // Straight implementation of Dijkstra's algorithm
     template <class G, class P>
     static void dijkstra(G& g, const P& p, vert_id src, std::vector<std::pair<vert_id, Wt>>& out) {
-        unsigned int sz = g.size();
+        size_t sz = g.size();
         if (sz == 0)
             return;
         grow_scratch(sz);
@@ -859,7 +868,7 @@ class GraphOps {
     template <class G, class P>
     static void chrome_dijkstra(G& g, const P& p, std::vector<std::vector<vert_id>>& colour_succs, vert_id src,
                                 std::vector<std::pair<vert_id, Wt>>& out) {
-        unsigned int sz = g.size();
+        size_t sz = g.size();
         if (sz == 0)
             return;
         grow_scratch(sz);
@@ -922,7 +931,7 @@ class GraphOps {
     template <class G, class P, class S>
     static void dijkstra_recover(G& g, const P& p, const S& is_stable, vert_id src,
                                  std::vector<std::pair<vert_id, Wt>>& out) {
-        unsigned int sz = g.size();
+        size_t sz = g.size();
         if (sz == 0)
             return;
         if (is_stable[src])
@@ -986,7 +995,7 @@ class GraphOps {
     template <class G, class P>
     static bool repair_potential(G& g, P& p, vert_id ii, vert_id jj) {
         // Ensure there's enough scratch space.
-        unsigned int sz = g.size();
+        size_t sz = g.size();
         // assert(src < (int) sz && dest < (int) sz);
         grow_scratch(sz);
 
@@ -1035,7 +1044,7 @@ class GraphOps {
 
     template <class G, class P, class V>
     static void close_after_widen(G& g, P& p, const V& is_stable, edge_vector& delta) {
-        unsigned int sz = g.size();
+        size_t sz = g.size();
         grow_scratch(sz);
         //      assert(orig.size() == sz);
 
@@ -1141,7 +1150,7 @@ class GraphOps {
 
     template <class G, class P>
     static void close_after_assign(G& g, P& p, vert_id v, edge_vector& delta) {
-        unsigned int sz = g.size();
+        size_t sz = g.size();
         grow_scratch(sz);
         {
             std::vector<std::pair<vert_id, Wt>> aux;
@@ -1161,28 +1170,30 @@ class GraphOps {
 
 // Static data allocation
 template <class Wt>
-char* GraphOps<Wt>::edge_marks = nullptr;
+thread_local char* GraphOps<Wt>::edge_marks = nullptr;
 
 // Used for Bellman-Ford queueing
 template <class Wt>
-typename GraphOps<Wt>::vert_id* GraphOps<Wt>::dual_queue = NULL;
+thread_local typename GraphOps<Wt>::vert_id* GraphOps<Wt>::dual_queue = NULL;
 
 template <class Wt>
-int* GraphOps<Wt>::vert_marks = nullptr;
+thread_local int* GraphOps<Wt>::vert_marks = nullptr;
 
 template <class Wt>
-unsigned int GraphOps<Wt>::scratch_sz = 0;
+thread_local size_t GraphOps<Wt>::scratch_sz = 0;
 
 template <class G>
-std::vector<typename G::Wt> GraphOps<G>::dists;
+thread_local std::vector<typename G::Wt> GraphOps<G>::dists;
 template <class G>
-std::vector<typename G::Wt> GraphOps<G>::dists_alt;
+thread_local std::vector<typename G::Wt> GraphOps<G>::dists_alt;
 template <class G>
-std::vector<unsigned int> GraphOps<G>::dist_ts;
+thread_local std::vector<unsigned int> GraphOps<G>::dist_ts;
 template <class G>
-unsigned int GraphOps<G>::ts = 0;
+thread_local unsigned int GraphOps<G>::ts = 0;
 template <class G>
-unsigned int GraphOps<G>::ts_idx = 0;
+thread_local unsigned int GraphOps<G>::ts_idx = 0;
 
 } // namespace crab
+#ifdef __GNUC__
 #pragma GCC diagnostic pop
+#endif

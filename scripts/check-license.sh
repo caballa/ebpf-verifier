@@ -21,13 +21,12 @@ if [[ $(uname) == MINGW* ]] ; then
 fi
 
 ignore_res=()
-while IFS= read -r i; do
+while IFS=$'\r' read -r i; do
       if [[ $i =~ ^# ]] || [[ -z $i ]]; then # ignore comments
           continue
       fi
       ignore_res+=("$i")
-done <"$root/scripts/.check-license.ignore"
-
+done < "$root/scripts/.check-license.ignore"
 
 should_ignore() {
     for re in "${ignore_res[@]}"; do

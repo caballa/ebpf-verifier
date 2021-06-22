@@ -11,7 +11,8 @@
 
 #include "crab_utils/bignums.hpp"
 #include "crab_utils/debug.hpp"
-#include "crab_utils/patricia_trees.hpp"
+#include "radix_tree/radix_tree.hpp"
+using index_t = uint64_t;
 
 /* Basic type definitions */
 
@@ -41,21 +42,25 @@ class variable_t final {
 
     [[nodiscard]] std::string name() const { return names.at(_id); }
 
+    bool is_type() { return names.at(_id).find(".type") != std::string::npos; }
+
     friend std::ostream& operator<<(std::ostream& o, variable_t v)  { return o << names.at(v._id); }
 
     // var_factory portion.
     // This singleton is eBPF-specific, to avoid life time issues and/or passing factory explicitly everywhere:
   private:
     static variable_t make(const std::string& name);
-    static std::vector<std::string> names;
+    static thread_local std::vector<std::string> names;
 
   public:
+    static void clear_thread_local_state();
     static variable_t reg(data_kind_t, int);
     static variable_t cell_var(data_kind_t array, index_t offset, unsigned size);
     static variable_t map_value_size();
     static variable_t map_key_size();
     static variable_t meta_offset();
     static variable_t packet_size();
+    static variable_t instruction_count();
 }; // class variable_t
 
 inline size_t hash_value(variable_t v) { return v.hash(); }

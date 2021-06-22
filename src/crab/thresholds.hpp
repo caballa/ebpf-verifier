@@ -1,8 +1,8 @@
 // Copyright (c) Prevail Verifier contributors.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <unordered_map>
+#include <map>
 #include <algorithm>
 #include <climits>
 
@@ -10,7 +10,7 @@
 
 #include "crab/cfg.hpp"
 #include "crab/interval.hpp"
-#include "crab/linear_constraints.hpp"
+#include "crab/linear_constraint.hpp"
 #include "crab/wto.hpp"
 #include "crab_utils/debug.hpp"
 
@@ -26,16 +26,16 @@ class thresholds_t final {
 
   private:
     std::vector<bound_t> m_thresholds;
-    unsigned int m_size;
+    size_t m_size;
 
   public:
-    explicit thresholds_t(int size = UINT_MAX) : m_size(size) {
+    explicit thresholds_t(size_t size = UINT_MAX) : m_size(size) {
         m_thresholds.push_back(bound_t::minus_infinity());
         m_thresholds.emplace_back(0);
         m_thresholds.push_back(bound_t::plus_infinity());
     }
 
-    unsigned size() const { return m_thresholds.size(); }
+    size_t size() const { return m_thresholds.size(); }
 
     void add(bound_t v1);
 
@@ -52,7 +52,7 @@ class wto_thresholds_t final {
     // maximum number of thresholds
     size_t m_max_size;
     // keep a set of thresholds per wto head
-    std::unordered_map<label_t, thresholds_t> m_head_to_thresholds;
+    std::map<label_t, thresholds_t> m_head_to_thresholds;
     // the top of the stack is the current wto head
     std::vector<label_t> m_stack;
 
@@ -61,9 +61,9 @@ class wto_thresholds_t final {
   public:
     wto_thresholds_t(cfg_t& cfg, size_t max_size) : m_cfg(cfg), m_max_size(max_size) {}
 
-    void operator()(wto_vertex_t& vertex);
+    void operator()(const label_t& vertex);
 
-    void operator()(wto_cycle_t& cycle);
+    void operator()(std::shared_ptr<wto_cycle_t>& cycle);
 
     friend std::ostream& operator<<(std::ostream& o, const wto_thresholds_t& t);
 

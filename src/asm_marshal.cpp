@@ -1,11 +1,9 @@
 // Copyright (c) Prevail Verifier contributors.
 // SPDX-License-Identifier: MIT
 #include <cassert>
-#include <unordered_map>
+#include <map>
 #include <variant>
 #include <vector>
-
-#include "linux_ebpf.hpp"
 
 #include "asm_marshal.hpp"
 #include "asm_ostream.hpp"
@@ -76,7 +74,7 @@ struct MarshalVisitor {
     }
 
   public:
-    std::function<auto(std::string)->int16_t> label_to_offset;
+    std::function<auto(label_t)->int16_t> label_to_offset;
 
     vector<ebpf_inst> operator()(Undefined const& a) {
         assert(false);
@@ -101,7 +99,7 @@ struct MarshalVisitor {
                                   res.opcode |= INST_SRC_REG;
                                   res.src = right.v;
                               },
-                              [&](Imm right) { res.imm = right.v; }},
+                              [&](Imm right) { res.imm = static_cast<int32_t>(right.v); }},
                    b.v);
         return {res};
     }
@@ -154,7 +152,7 @@ struct MarshalVisitor {
                                  res.opcode |= INST_SRC_REG;
                                  res.src = right.v;
                              },
-                             [&](Imm right) { res.imm = right.v; }},
+                             [&](Imm right) { res.imm = static_cast<int32_t>(right.v); }},
                   b.cond->right);
             return {res};
         } else {
@@ -184,7 +182,7 @@ struct MarshalVisitor {
                 res.src = std::get<Reg>(b.value).v;
             } else {
                 res.opcode |= 0x0;
-                res.imm = std::get<Imm>(b.value).v;
+                res.imm = static_cast<int32_t>(std::get<Imm>(b.value).v);
             }
         }
         return {res};
@@ -244,7 +242,7 @@ static int size(Instruction inst) {
 
 static auto get_labels(const InstructionSeq& insts) {
     pc_t pc = 0;
-    std::unordered_map<std::string, pc_t> pc_of_label;
+    std::map<label_t, pc_t> pc_of_label;
     for (auto [label, inst] : insts) {
         pc_of_label[label] = pc;
         pc += size(inst);
@@ -257,9 +255,10 @@ vector<ebpf_inst> marshal(const InstructionSeq& insts) {
     auto pc_of_label = get_labels(insts);
     pc_t pc = 0;
     for (auto [label, ins] : insts) {
+        (void)label; // unused
         if (std::holds_alternative<Jmp>(ins)) {
             Jmp& jmp = std::get<Jmp>(ins);
-            jmp.target = std::to_string(pc_of_label.at(jmp.target));
+            jmp.target = label_t(pc_of_label.at(jmp.target));
         }
         for (auto e : marshal(ins, pc)) {
             pc++;

@@ -1,5 +1,5 @@
 // Copyright (c) Prevail Verifier contributors.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 #include "crab/split_dbm.hpp"
 
 #include <utility>
@@ -106,12 +106,12 @@ void SplitDBM::diffcsts_of_assign(variable_t x, const linear_expression_t& exp,
     std::vector<std::pair<variable_t, Wt>> terms;
     bool overflow;
 
-    Wt residual(convert_NtoW(exp.constant(), overflow));
+    Wt residual(convert_NtoW(exp.constant_term(), overflow));
     if (overflow) {
         return;
     }
 
-    for (auto [y, n] : exp) {
+    for (auto [y, n] : exp.variable_terms()) {
         Wt coeff(convert_NtoW(n, overflow));
         if (overflow) {
             continue;
@@ -168,13 +168,13 @@ void SplitDBM::diffcsts_of_lin_leq(const linear_expression_t& exp,
                                    std::vector<std::pair<variable_t, Wt>>& ubs) {
     bool underflow, overflow;
 
-    Wt exp_ub = -(convert_NtoW(exp.constant(), overflow));
+    Wt exp_ub = -(convert_NtoW(exp.constant_term(), overflow));
     if (overflow) {
         return;
     }
 
     // temporary hack
-    convert_NtoW(exp.constant() - 1, underflow);
+    convert_NtoW(exp.constant_term() - 1, underflow);
     if (underflow) {
         // We don't like MIN either because the code will compute
         // minus MIN and it will silently overflow.
@@ -187,7 +187,7 @@ void SplitDBM::diffcsts_of_lin_leq(const linear_expression_t& exp,
     std::optional<variable_t> unbounded_ubvar;
 
     std::vector<std::pair<std::pair<Wt, variable_t>, Wt>> pos_terms, neg_terms;
-    for (auto [y, n] : exp) {
+    for (auto [y, n] : exp.variable_terms()) {
         Wt coeff(convert_NtoW(n, overflow));
         if (overflow) {
             continue;
@@ -492,7 +492,7 @@ SplitDBM SplitDBM::operator|(const SplitDBM& _o) & {
         auto it = o.vert_map.find(v);
         // Variable exists in both
         if (it != o.vert_map.end()) {
-            out_vmap.insert(vmap_elt_t(v, perm_x.size()));
+            out_vmap.insert(vmap_elt_t(v, static_cast<vert_id>(perm_x.size())));
             out_revmap.push_back(v);
 
             pot_rx.push_back(potential[n] - potential[0]);
@@ -504,7 +504,7 @@ SplitDBM SplitDBM::operator|(const SplitDBM& _o) & {
             perm_y.push_back(it->second);
         }
     }
-    unsigned int sz = perm_x.size();
+    size_t sz = perm_x.size();
 
     // Build the permuted view of x and y.
     assert(g.size() > 0);
@@ -665,7 +665,7 @@ SplitDBM SplitDBM::widen(SplitDBM o) {
             auto it = o.vert_map.find(v);
             // Variable exists in both
             if (it != o.vert_map.end()) {
-                out_vmap.insert(vmap_elt_t(v, perm_x.size()));
+                out_vmap.insert(vmap_elt_t(v, static_cast<vert_id>(perm_x.size())));
                 out_revmap.push_back(v);
 
                 widen_pot.push_back(potential[n] - potential[0]);
@@ -725,7 +725,7 @@ SplitDBM SplitDBM::operator&(SplitDBM o) {
         meet_pi.emplace_back(0);
         meet_rev.push_back(std::nullopt);
         for (auto [v, n] : vert_map) {
-            vert_id vv = perm_x.size();
+            vert_id vv = static_cast<vert_id>(perm_x.size());
             meet_verts.insert(vmap_elt_t(v, vv));
             meet_rev.push_back(v);
 
@@ -739,7 +739,7 @@ SplitDBM SplitDBM::operator&(SplitDBM o) {
             auto it = meet_verts.find(v);
 
             if (it == meet_verts.end()) {
-                vert_id vv = perm_y.size();
+                vert_id vv = static_cast<vert_id>(perm_y.size());
                 meet_rev.push_back(v);
 
                 perm_y.push_back(n);
@@ -807,12 +807,6 @@ void SplitDBM::operator+=(const linear_constraint_t& cst) {
     CrabStats::count("SplitDBM.count.add_constraints");
     ScopedCrabStats __st__("SplitDBM.add_constraints");
 
-    // XXX: we do nothing with unsigned linear inequalities
-    if (cst.is_inequality() && cst.is_unsigned()) {
-        CRAB_WARN("unsigned inequality ", cst, " skipped by split_dbm domain");
-        return;
-    }
-
     if (is_bottom())
         return;
     normalize();
@@ -827,7 +821,7 @@ void SplitDBM::operator+=(const linear_constraint_t& cst) {
         return;
     }
 
-    if (cst.is_inequality()) {
+    if (cst.kind() == constraint_kind_t::LESS_THAN_OR_EQUALS_ZERO) {
         if (!add_linear_leq(cst.expression())) {
             set_to_bottom();
         }
@@ -836,21 +830,18 @@ void SplitDBM::operator+=(const linear_constraint_t& cst) {
         return;
     }
 
-    if (cst.is_strict_inequality()) {
+    if (cst.kind() == constraint_kind_t::LESS_THAN_ZERO) {
         // We try to convert a strict to non-strict.
         // e < 0 --> e <= -1
-        auto nc = linear_constraint_t(cst.expression() + 1, cst_kind::INEQUALITY, cst.is_signed());
-        if (nc.is_inequality()) {
-            // here we succeed
-            if (!add_linear_leq(nc.expression())) {
-                set_to_bottom();
-            }
-            CRAB_LOG("zones-split", std::cout << "--- " << cst << "\n" << *this << "\n");
-            return;
+        auto nc = linear_constraint_t(cst.expression() + 1, constraint_kind_t::LESS_THAN_OR_EQUALS_ZERO);
+        if (!add_linear_leq(nc.expression())) {
+            set_to_bottom();
         }
+        CRAB_LOG("zones-split", std::cout << "--- " << cst << "\n" << *this << "\n");
+        return;
     }
 
-    if (cst.is_equality()) {
+    if (cst.kind() == constraint_kind_t::EQUALS_ZERO) {
         const linear_expression_t& exp = cst.expression();
         if (!add_linear_leq(exp) || !add_linear_leq(-exp)) {
             CRAB_LOG("zones-split", std::cout << " ~~> _|_"
@@ -862,7 +853,7 @@ void SplitDBM::operator+=(const linear_constraint_t& cst) {
         return;
     }
 
-    if (cst.is_disequation()) {
+    if (cst.kind() == constraint_kind_t::NOT_ZERO) {
         add_disequation(cst.expression());
         return;
     }
@@ -1103,8 +1094,8 @@ void SplitDBM::apply(arith_binop_t op, variable_t x, variable_t y, variable_t z)
     normalize();
 
     switch (op) {
-    case arith_binop_t::ADD: assign(x, var_add(y, z)); return;
-    case arith_binop_t::SUB: assign(x, var_sub(y, z)); return;
+    case arith_binop_t::ADD: assign(x, linear_expression_t(y) + z); return;
+    case arith_binop_t::SUB: assign(x, linear_expression_t(y) - z); return;
     // For the rest of operations, we fall back on intervals.
     case arith_binop_t::MUL: set(x, get_interval(y) * get_interval(z)); break;
     case arith_binop_t::SDIV: set(x, get_interval(y) / get_interval(z)); break;
@@ -1126,9 +1117,9 @@ void SplitDBM::apply(arith_binop_t op, variable_t x, variable_t y, const number_
     normalize();
 
     switch (op) {
-    case arith_binop_t::ADD: assign(x, var_add(y, k)); return;
-    case arith_binop_t::SUB: assign(x, var_sub(y, k)); return;
-    case arith_binop_t::MUL: assign(x, var_mul(k, y)); return;
+    case arith_binop_t::ADD: assign(x, linear_expression_t(y) + k); return;
+    case arith_binop_t::SUB: assign(x, linear_expression_t(y) - k); return;
+    case arith_binop_t::MUL: assign(x, linear_expression_t(k, y)); return;
     // For the rest of operations, we fall back on intervals.
     case arith_binop_t::SDIV: set(x, get_interval(y) / interval_t(k)); break;
     case arith_binop_t::UDIV: set(x, get_interval(y).UDiv(interval_t(k))); break;
@@ -1223,10 +1214,19 @@ std::ostream& operator<<(std::ostream& o, SplitDBM& dom) {
             first = false;
         else
             o << ", ";
-        o << *(dom.rev_map[v]) << " -> ";
-        if (v_out.lb() == v_out.ub())
-            o << "[" << v_out.lb() << "]";
-        else
+        variable_t variable = *(dom.rev_map[v]);
+        o << variable << "=";
+        if (v_out.lb() == v_out.ub()) {
+            if (variable.is_type()) {
+                static const char* type_string[] = {"shared_pointer", "packet_pointer", "stack_pointer", "ctx_pointer", "number", "map_fd", "uninitialized"};
+                int type = (int)v_out.lb().number().value();
+                if (type <= 0 && type > -static_cast<int>(std::size(type_string)))
+                    o << type_string[-type];
+                else
+                    o << "map_value_of_size(" << v_out.lb() << ")";
+            } else
+                o << "[" << v_out.lb() << "]";
+        } else
             o << v_out;
     }
     if (!first) o << "\n ";

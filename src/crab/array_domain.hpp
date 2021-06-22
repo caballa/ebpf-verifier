@@ -1,5 +1,5 @@
 // Copyright (c) Prevail Verifier contributors.
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 /*******************************************************************************
  * Array expansion domain
  *
@@ -40,13 +40,13 @@
 
 #include "crab/interval.hpp"
 #include "crab/split_dbm.hpp"
-#include "crab_utils/patricia_trees.hpp"
+#include "radix_tree/radix_tree.hpp"
 
 #include "asm_ostream.hpp"
 #include "config.hpp"
 #include "dsl_syntax.hpp"
-#include "gpl/spec_prototypes.hpp"
-#include "gpl/spec_type_descriptors.hpp"
+#include "helpers.hpp"
+#include "spec_type_descriptors.hpp"
 
 #include "crab/bitset_domain.hpp"
 
@@ -55,7 +55,27 @@ namespace crab::domains {
 // Numerical abstract domain.
 using NumAbsDomain = SplitDBM;
 
-using offset_t = index_t;
+class offset_t final {
+    index_t _index;
+    int _prefix_length;
+
+public:
+    static constexpr int bitsize = 8 * sizeof(index_t);
+    offset_t() : _prefix_length(bitsize) {}
+    offset_t(index_t index) : _index(index), _prefix_length(bitsize) {}
+    offset_t(index_t index, int prefix_length) : _index(index), _prefix_length(prefix_length) {}
+    explicit operator int() const { return static_cast<int>(_index); }
+    operator index_t() const { return _index; }
+    int prefix_length() const { return _prefix_length; }
+
+    index_t operator[](int n) const { return (_index >> (bitsize - 1 - n)) & 1; }
+};
+
+// Get the length of a key, which is the size usable with the [] operator.
+inline int radix_length(const offset_t& offset) { return offset.prefix_length(); }
+
+offset_t radix_substr(const offset_t& key, int begin, int length);
+offset_t radix_join(const offset_t& entry1, const offset_t& entry2);
 
 /*
    Conceptually, a cell is tuple of an array, offset, size, and
@@ -144,40 +164,25 @@ class offset_map_t final {
       patterns, negative offsets can be used but they are treated
       as large unsigned numbers.
     */
-    using patricia_tree_t = patricia_tree<offset_t, cell_set_t>;
-    using partial_order_t = typename patricia_tree_t::partial_order_t;
+    using patricia_tree_t = radix_tree<offset_t, cell_set_t>;
 
     patricia_tree_t _map;
 
     // for algorithm::lower_bound and algorithm::upper_bound
     struct compare_binding_t {
-        bool operator()(const typename patricia_tree_t::binding_t& kv, const offset_t& o) const { return kv.first < o; }
-        bool operator()(const offset_t& o, const typename patricia_tree_t::binding_t& kv) const { return o < kv.first; }
-        bool operator()(const typename patricia_tree_t::binding_t& kv1,
-                        const typename patricia_tree_t::binding_t& kv2) const {
+        bool operator()(const typename patricia_tree_t::value_type& kv, const offset_t& o) const { return kv.first < o; }
+        bool operator()(const offset_t& o, const typename patricia_tree_t::value_type& kv) const { return o < kv.first; }
+        bool operator()(const typename patricia_tree_t::value_type& kv1,
+                        const typename patricia_tree_t::value_type& kv2) const {
             return kv1.first < kv2.first;
         }
     };
-
-    class domain_po : public partial_order_t {
-        bool leq(cell_set_t x, cell_set_t y) override {
-            {
-                cell_set_t z;
-                boost::set_difference(x, y, std::inserter(z, z.end()));
-                return z.empty();
-            }
-        }
-        // default value is bottom (i.e., empty map)
-        bool default_is_top() override { return false; }
-    }; // class domain_po
-
-    explicit offset_map_t(const patricia_tree_t& m) : _map(m) {}
 
     void remove_cell(const cell_t& c);
 
     void insert_cell(const cell_t& c);
 
-    [[nodiscard]] std::optional<cell_t> get_cell(offset_t o, unsigned size) const;
+    [[nodiscard]] std::optional<cell_t> get_cell(offset_t o, unsigned size);
 
     cell_t mk_cell(offset_t o, unsigned size);
 
@@ -187,12 +192,6 @@ class offset_map_t final {
     [[nodiscard]] bool empty() const { return _map.empty(); }
 
     [[nodiscard]] std::size_t size() const { return _map.size(); }
-
-    // leq operator
-    bool operator<=(const offset_map_t& o) const {
-        domain_po po;
-        return _map.leq(o._map, po);
-    }
 
     void operator-=(const cell_t& c) { remove_cell(c); }
 
@@ -207,12 +206,11 @@ class offset_map_t final {
 
     [[nodiscard]] std::vector<cell_t> get_overlap_cells_symbolic_offset(const NumAbsDomain& dom,
                                                                         const linear_expression_t& symb_lb,
-                                                                        const linear_expression_t& symb_ub) const;
+                                                                        const linear_expression_t& symb_ub);
 
-    friend std::ostream& operator<<(std::ostream& o, const offset_map_t& m);
+    friend std::ostream& operator<<(std::ostream& o, offset_map_t& m);
 
     /* Operations needed if used as value in a separate_domain */
-    bool operator==(const offset_map_t& o) const { return *this <= o && o <= *this; }
     [[nodiscard]] bool is_top() const { return empty(); }
     [[nodiscard]] bool is_bottom() const { return false; }
     /*
@@ -227,7 +225,7 @@ class offset_map_t final {
 
 // We use a global array map
 using array_map_t = std::unordered_map<data_kind_t, offset_map_t>;
-extern array_map_t global_array_map;
+extern thread_local array_map_t global_array_map;
 void clear_global_state();
 
 class array_domain_t final {
@@ -297,6 +295,7 @@ class array_domain_t final {
     }
 
     std::optional<linear_expression_t> load(NumAbsDomain& inv, data_kind_t kind, const linear_expression_t& i, int width);
+    bool all_num(NumAbsDomain& inv, const linear_expression_t& lb, const linear_expression_t& ub);
 
     std::optional<variable_t> store(NumAbsDomain& inv, data_kind_t kind, const linear_expression_t& idx, const linear_expression_t& elem_size,
                                     const linear_expression_t& val);
@@ -313,7 +312,7 @@ class array_domain_t final {
     void store_numbers(NumAbsDomain& inv, variable_t _idx, variable_t _width) {
 
         // TODO: this should be an user parameter.
-        const number_t max_num_elems = STACK_SIZE;
+        const number_t max_num_elems = EBPF_STACK_SIZE;
 
         if (is_bottom())
             return;
